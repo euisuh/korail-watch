@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import time
+from collections import deque
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -55,6 +56,16 @@ def _same_train(left: Train, right: Train) -> bool:
     # Reconciliation objects do not carry live seat-availability flags.
     fields = ("key", "date", "departure", "arrival", "dep_time", "arr_time")
     return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+
+def _matches_trip(trip: Trip, train: Train) -> bool:
+    """Match persisted account records without discarding departed trains."""
+    return (
+        train.date == trip.date
+        and train.departure in trip.departures
+        and train.arrival in trip.arrivals
+        and trip.start <= train.dep_time <= trip.end
+    )
 
 
 def _prepare_dir(state_dir: Path) -> None:
@@ -137,28 +148,37 @@ def _preserve_mismatch(db: sqlite3.Connection, hold: Hold) -> None:
         _set(db, "ambiguous_hold", _hold_data(hold))
 
 
-def _drain_outbox(db: sqlite3.Connection, notifier) -> None:
+def _drain_outbox(db: sqlite3.Connection, notifier, *, wait: bool = False) -> None:
     if notifier is None:
         return
-    row = db.execute(
-        "SELECT id, payload, attempts, next_attempt FROM outbox ORDER BY id LIMIT 1"
-    ).fetchone()
-    if not row or row[3] > _now().timestamp():
-        return
-    try:
-        notifier.send(row[1])
-    except Exception as exc:
-        attempts = row[2] + 1
-        retry_after = exc.retry_after if isinstance(exc, TransientError) else None
-        delay = min(3600.0, max(1.0, retry_after if retry_after is not None else 5 * 2 ** min(attempts, 8)))
-        with db:
-            db.execute(
-                "UPDATE outbox SET attempts = ?, next_attempt = ? WHERE id = ?",
-                (attempts, _now().timestamp() + delay, row[0]),
-            )
-    else:
-        with db:
-            db.execute("DELETE FROM outbox WHERE id = ?", (row[0],))
+    while True:
+        row = db.execute(
+            "SELECT id, payload, attempts, next_attempt FROM outbox ORDER BY id LIMIT 1"
+        ).fetchone()
+        if not row:
+            return
+        delay = max(0.0, row[3] - _now().timestamp())
+        if delay:
+            if not wait:
+                return
+            time.sleep(delay)
+        try:
+            notifier.send(row[1])
+        except Exception as exc:
+            attempts = row[2] + 1
+            retry_after = exc.retry_after if isinstance(exc, TransientError) else None
+            delay = min(3600.0, max(1.0, retry_after if retry_after is not None else 5 * 2 ** min(attempts, 8)))
+            with db:
+                db.execute(
+                    "UPDATE outbox SET attempts = ?, next_attempt = ? WHERE id = ?",
+                    (attempts, _now().timestamp() + delay, row[0]),
+                )
+            if not wait:
+                return
+        else:
+            with db:
+                db.execute("DELETE FROM outbox WHERE id = ?", (row[0],))
+            return
 
 
 def _windows(trip: Trip) -> list[str]:
@@ -172,9 +192,15 @@ def _windows(trip: Trip) -> list[str]:
     return windows
 
 
-def _targets(trip: Trip) -> list[tuple[str, str, str]]:
+def _targets(trip: Trip) -> list[tuple[str, str, str, str]]:
     routes = [(departure, arrival) for departure in trip.departures for arrival in trip.arrivals]
-    return [(departure, arrival, after) for after in _windows(trip) for departure, arrival in routes]
+    windows = _windows(trip)
+    limits = windows[1:] + [trip.end + ":59"]
+    return [
+        (departure, arrival, after, limit)
+        for after, limit in zip(windows, limits)
+        for departure, arrival in routes
+    ]
 
 
 def _past_cutoff(trip: Trip) -> bool:
@@ -208,12 +234,12 @@ def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
         if exact:
             _confirm(db, exact)
             return "existing-ticket" if exact.paid else "existing-hold"
-        matching = next((hold for hold in remote if trip.matches(hold.train)), None)
+        matching = next((hold for hold in remote if _matches_trip(trip, hold.train)), None)
         if matching:
             _preserve_mismatch(db, matching)
         return "ambiguous"
 
-    matching = next((hold for hold in remote if trip.matches(hold.train)), None)
+    matching = next((hold for hold in remote if _matches_trip(trip, hold.train)), None)
     if matching:
         _confirm(db, matching)
         return "existing-ticket" if matching.paid else "existing-hold"
@@ -271,7 +297,8 @@ def run(
         if not acquired:
             return "locked"
         with closing(_connect(state_dir)) as db:
-            _drain_outbox(db, notifier)
+            wait_for_notification = armed and not once
+            _drain_outbox(db, notifier, wait=wait_for_notification)
             local = _get(db, "hold")
             if local:
                 return "existing-ticket" if local.get("paid") else "existing-hold"
@@ -279,7 +306,7 @@ def run(
                 return "ambiguous"
             result = _reconcile(db, trip, provider)
             if result:
-                _drain_outbox(db, notifier)
+                _drain_outbox(db, notifier, wait=wait_for_notification)
                 return result
             if _past_cutoff(trip):
                 return "cutoff"
@@ -289,18 +316,23 @@ def run(
             cycles = 1 if once or not armed else max_cycles
             available = False
             cycle = 0
+            incomplete = False
             while cycles is None or cycle < cycles:
                 attempted: set[str] = set()
-                for offset in range(len(targets)):
+                pages = deque(
+                    (*targets[(start + offset) % len(targets)], (start + offset) % len(targets))
+                    for offset in range(len(targets))
+                )
+                while pages:
                     if _past_cutoff(trip):
                         return "cutoff"
-                    position = (start + offset) % len(targets)
-                    departure, arrival, after = targets[position]
+                    departure, arrival, after, limit, position = pages.popleft()
                     with db:
                         _set(db, "cursor", (position + 1) % len(targets))
                     try:
                         trains = provider.search(trip, departure, arrival, after)
                     except TransientError as exc:
+                        incomplete = True
                         time.sleep(max(0.0, exc.retry_after if exc.retry_after is not None else 5.0))
                         continue
                     except BlockedError:
@@ -317,12 +349,20 @@ def run(
                             attempted.add(train.key)
                             result = _attempt(db, trip, provider, train)
                             if result:
-                                _drain_outbox(db, notifier)
+                                _drain_outbox(db, notifier, wait=wait_for_notification)
                                 return result
+                    if trains:
+                        next_after = max(train.dep_time for train in trains) + ":01"
+                        if next_after <= after:
+                            incomplete = True
+                        elif next_after < limit:
+                            pages.append((departure, arrival, next_after, limit, position))
                 cycle += 1
                 start = (start + 1) % len(targets)
                 with db:
                     _set(db, "cursor", start)
+            if incomplete:
+                return "incomplete"
             return "available" if available else "not-found"
 
 

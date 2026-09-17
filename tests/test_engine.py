@@ -116,6 +116,25 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(provider.reserve_calls, [])
 
+    def test_dense_hour_continues_from_last_result_without_starving_routes(self):
+        first = train(key="1", dep_time="12:10")
+        last = train(key="2", dep_time="12:35")
+        later = train(key="3", dep_time="12:40")
+
+        class Paged(Provider):
+            def search(self, requested, departure, arrival, after):
+                self.calls.append((departure, arrival, after))
+                if after == "12:00:00":
+                    return [first, last]
+                if after == "12:35:01":
+                    return [later, train(key="4", dep_time="13:10")]
+                return []
+
+        provider = Paged()
+        requested = trip(end="13:00", departures=("서울",), arrivals=("대전",))
+        self.assertEqual(run(requested, provider, None, self.state, once=True), "available")
+        self.assertIn(("서울", "대전", "12:35:01"), provider.calls)
+
     def test_general_sold_out_falls_back_to_special_and_persists_before_notify(self):
         selected = train()
 
@@ -169,6 +188,14 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(second.reserve_calls, [])
         self.assertEqual(status(self.state)["hold"]["reference"], "R3")
 
+    def test_departed_matching_hold_still_stops_scanning(self):
+        provider = Provider([train(key="later", dep_time="14:00")])
+        provider.remote = [Hold("EARLIER", train(general=False, special=False), None, None)]
+        with patch("korail_watch.engine._now", return_value=datetime(2099, 9, 24, 13, 0, tzinfo=KST)):
+            self.assertEqual(run(trip(), provider, Notifier(), self.state, armed=True, once=True), "existing-hold")
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(provider.reserve_calls, [])
+
     def test_ambiguous_write_with_empty_reconciliation_never_retries(self):
         class Ambiguous(Provider):
             def reserve(self, selected, seat_class, adults):
@@ -199,6 +226,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(run(trip(), provider, notifier, self.state, armed=True, once=True), "reserved")
         self.assertEqual(status(self.state)["notifications_pending"], 1)
         self.assertEqual(len(provider.reserve_calls), 1)
+
+    def test_watch_retries_notification_without_returning_to_provider(self):
+        provider = Provider([train()])
+        notifier = Notifier(TransientError(retry_after=7))
+        with patch("korail_watch.engine.time.sleep") as sleep:
+            self.assertEqual(run(trip(), provider, notifier, self.state, armed=True), "reserved")
+        sleep.assert_called_once()
+        self.assertAlmostEqual(sleep.call_args.args[0], 7, places=2)
+        self.assertEqual(len(notifier.messages), 2)
+        self.assertEqual(len(provider.reserve_calls), 1)
+        self.assertEqual(status(self.state)["notifications_pending"], 0)
         self.assertEqual(run(trip(), provider, Notifier(), self.state, armed=True, once=True), "existing-hold")
         self.assertEqual(len(provider.reserve_calls), 1)
 
@@ -231,7 +269,7 @@ class EngineTests(unittest.TestCase):
 
         provider = Limited()
         with patch("korail_watch.engine.time.sleep") as sleep:
-            self.assertEqual(run(trip(), provider, None, self.state, once=True), "not-found")
+            self.assertEqual(run(trip(), provider, None, self.state, once=True), "incomplete")
         sleep.assert_called_once_with(7)
         self.assertEqual(provider.reserve_calls, [])
 
