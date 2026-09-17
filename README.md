@@ -3,7 +3,7 @@
 Korail Watch is a small macOS-first Python CLI that searches every configured
 station pair for one adult. It prefers an immediate travel entitlement and joins
 one waitlist only after a complete pass finds no immediate option. It never pays,
-cancels, or creates multiple bookings.
+cancels, or creates concurrent unpaid bookings.
 
 This project uses Korail's unofficial mobile interface through a pinned
 [`korail2` fork](https://github.com/dhfhfk/korail2/tree/4b134266fff097ea0fd54e9f760cb128b6c8f878).
@@ -81,28 +81,50 @@ requests, plus login and reconciliation, so a complete run takes several
 minutes. Its final line is the termination outcome; `not-found` means the full
 configured window was checked, not that the command hung.
 
-No live reservation is attempted until `--arm` is present:
+No live reservation is attempted until `--arm` is present. The default remains
+single-result mode and stops after the first queue, hold, or ticket:
 
 ```sh
 caffeinate -i korail-watch watch --arm --config trip.toml
 ```
 
+Continuous mode keeps watching until the trip cutoff, including after payment or
+a safely verified missed payment deadline:
+
+```sh
+caffeinate -i korail-watch watch --arm --continuous --config trip.toml
+```
+
+It allows at most one active unpaid hold or waitlist at a time. Paid tickets are
+preserved and excluded while the watcher looks for a different train; there is
+no departure-time ranking. An unpaid hold is archived and searching resumes only
+after its provider deadline plus a 60-second grace and two complete account
+snapshots, at least 30 seconds apart, prove the known PNR absent with no
+conflicting unpaid record. Missing deadlines, read errors, identity conflicts,
+or ambiguous state stop new writes rather than guessing.
+
 The armed command logs in, sends a Telegram preflight message, and then starts
 watching. `caffeinate -i` prevents idle system sleep while the terminal process
-runs; closing the terminal or sleeping/restarting the Mac still stops it. A
-finite foreground process is deliberate: do not configure launchd `KeepAlive`
-or an unconditional restart, because success and security blocks must remain
-stopped.
+runs; closing the terminal or sleeping/restarting the Mac still stops it. Press
+Ctrl-C to stop a foreground watcher. A finite process is deliberate: do not
+configure launchd `KeepAlive` or an unconditional restart, because security and
+ambiguous-state stops must remain stopped.
 
 After `check` and `notify-test` work, the included launchd helper can start the
 watcher at login. Installation repeats the read-only check before loading
 anything; it refuses blocked, ambiguous, or failed results. It uses
-`KeepAlive=false`, so a successful hold or security stop is not restarted.
+`KeepAlive=false`, so any process exit is not automatically restarted. Omit the
+third argument for legacy single-result behavior, or install continuous mode
+explicitly:
 
 ```sh
 ./scripts/launchd.sh install "$PWD/trip.toml"
+./scripts/launchd.sh install "$PWD/trip.toml" --continuous
 ./scripts/launchd.sh uninstall
 ```
+
+`uninstall` stops the launchd watcher and removes its generated plist. Inspect
+`korail-watch status` before starting again; never launch a second process.
 
 Inspect durable local state at any time:
 
@@ -114,6 +136,11 @@ korail-watch status
 lock. A queue entry appears separately from a confirmed hold. While queued, the
 watcher monitors that same reservation and never starts another booking. Missing
 or uncertain queue state is treated as ambiguous and stops new attempts.
+
+In continuous mode, status also retains paid-ticket exclusions and the archive
+of expired holds with their verification evidence. These records prevent the
+same journey or an uncertain expiry from creating a duplicate. Do not edit or
+delete them to force a retry.
 
 A waitlist notification does not mean a seat is allocated and never asks for
 payment. When Korail allocates the queue entry, the watcher records a hold and
@@ -136,7 +163,9 @@ stops the process but preserves both the hold and pending notification for
 operator recovery.
 
 Legacy state remains compatible: a stored hold without a `kind` is treated as a
-seated hold. Do not delete queue or hold state to force another attempt.
+seated hold. Continuous mode does not use expiry to resolve an ambiguous write or
+unproven waitlist follow-up. Do not delete queue, hold, paid-exclusion, or archive
+state to force another attempt.
 
 The watcher uses one authenticated session, at least five seconds between
 requests, bounded retry behavior, and no parallel accounts, proxies, queue

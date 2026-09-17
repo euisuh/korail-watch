@@ -1,5 +1,7 @@
 import os
+import plistlib
 import stat
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -53,6 +55,17 @@ class CliTests(unittest.TestCase):
             cli._parser().parse_args(["watch"])
         self.assertEqual(2, raised.exception.code)
 
+    def test_continuous_is_explicit_and_watch_only(self):
+        args = cli._parser().parse_args(["watch", "--arm", "--continuous"])
+        self.assertTrue(args.continuous)
+
+        legacy = cli._parser().parse_args(["watch", "--arm"])
+        self.assertFalse(legacy.continuous)
+
+        with self.assertRaises(SystemExit) as raised:
+            cli._parser().parse_args(["check", "--continuous"])
+        self.assertEqual(2, raised.exception.code)
+
     def test_interval_cannot_be_faster_than_five_seconds(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "trip.toml"
@@ -98,6 +111,40 @@ class CliTests(unittest.TestCase):
         self.assertTrue(trip.allow_waitlist)
         self.assertTrue(trip.allow_standing)
         self.assertFalse(trip.allow_mixed)
+
+    def test_launchd_helper_adds_continuous_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            for name, body in {
+                "korail-watch": "#!/bin/sh\necho not-found\n",
+                "caffeinate": "#!/bin/sh\nexit 0\n",
+                "launchctl": "#!/bin/sh\nexit 0\n",
+            }.items():
+                executable = fake_bin / name
+                executable.write_text(body)
+                executable.chmod(0o755)
+            config = root / "trip.toml"
+            config.write_text("[trip]\n")
+            script = Path(__file__).parents[1] / "scripts" / "launchd.sh"
+            env = {
+                **os.environ,
+                "HOME": str(root),
+                "UID": "501",
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            }
+
+            subprocess.run(["sh", script, "install", config, "--continuous"], env=env, check=True, capture_output=True)
+            plist = root / "Library" / "LaunchAgents" / "com.euisuh.korail-watch.plist"
+            with plist.open("rb") as handle:
+                continuous = plistlib.load(handle)["ProgramArguments"]
+            self.assertEqual("--continuous", continuous[-1])
+
+            subprocess.run(["sh", script, "install", config], env=env, check=True, capture_output=True)
+            with plist.open("rb") as handle:
+                legacy = plistlib.load(handle)["ProgramArguments"]
+            self.assertNotIn("--continuous", legacy)
 
     def test_demo_does_not_touch_default_state(self):
         with tempfile.TemporaryDirectory() as home, patch.object(Path, "home", return_value=Path(home)):

@@ -46,7 +46,11 @@ proof that an ambiguous request failed. Existing matching paid ticket, unpaid
 hold, or waitlist entry also stops new booking attempts. Persist waitlists
 distinctly, monitor only that PNR for allocation, and atomically transition it to
 a hold when allocated. A waitlist has no payable deadline; only an allocated hold
-may instruct payment. Hold expiry never automatically starts a new booking.
+may instruct payment. Default mode stops at the first result. Explicit continuous
+mode may archive a missed-deadline hold and resume only after deadline plus grace
+and two complete, separated account snapshots prove its PNR absent. It preserves
+paid tickets as exclusions and permits no more than one active unpaid hold or
+waitlist while seeking alternatives through the trip cutoff.
 Telegram failures must not trigger another hold. Keep notification pending and
 retry independently with bounded backoff. Include actual provider payment
 deadline, or clearly say unavailable and request immediate app check. Never
@@ -91,7 +95,8 @@ issues, artifacts, or Git history.
 
 `korail_watch/engine.py` (core owner):
 - `run(trip, provider, notifier, state_dir: Path, *, armed=False,
-  once=False, max_cycles=None) -> str` and `status(state_dir) -> dict`.
+  once=False, max_cycles=None, continuous=False) -> str` and
+  `status(state_dir) -> dict`.
 - Engine handles lock, SQLite intent/hold/outbox, reconciliation, fair cursors,
   sold-out alternatives, stop at trip cutoff. Injection of sleep/clock accepted
   if useful for deterministic tests. Provider owns all network throttling.
@@ -100,6 +105,8 @@ issues, artifacts, or Git history.
 
 `korail_watch/cli.py` (ops owner): argparse commands `check`, `watch --arm`,
 `status`, `notify-test`, `configure`, `demo`; safe read-only default.
+`watch --continuous` is explicit and watch-only; omitting it preserves legacy
+single-result behavior. The launchd helper accepts the same optional third flag.
 `configure` uses getpass and saves local protected credentials file outside
 repo under ~/Library/Application Support/korail-watch, loaded by CLI only.
 Configuration from committed trip.example.toml with nonsecret capability flags.

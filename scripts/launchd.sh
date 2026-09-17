@@ -8,6 +8,11 @@ plist="$agents/$label.plist"
 case "${1:-}" in
   install)
     config=${2:-"$PWD/trip.toml"}
+    mode=${3:-}
+    case "$mode" in
+      ""|--continuous) ;;
+      *) echo "optional third argument must be --continuous" >&2; exit 2 ;;
+    esac
     config_dir=$(cd "$(dirname "$config")" && pwd)
     config="$config_dir/$(basename "$config")"
     watcher=$(command -v korail-watch)
@@ -20,14 +25,17 @@ case "${1:-}" in
       *) echo "Read-only check did not complete safely: $result" >&2; exit 1 ;;
     esac
     mkdir -p "$agents" "$HOME/Library/Logs"
-    python3 - "$plist" "$caffeinate" "$watcher" "$config" "$config_dir" <<'PY'
+    python3 - "$plist" "$caffeinate" "$watcher" "$config" "$config_dir" "$mode" <<'PY'
 import plistlib
 import sys
 
-path, caffeinate, watcher, config, working_directory = sys.argv[1:]
+path, caffeinate, watcher, config, working_directory, mode = sys.argv[1:]
+arguments = [caffeinate, "-i", watcher, "watch", "--arm", "--config", config]
+if mode:
+    arguments.append(mode)
 payload = {
     "Label": "com.euisuh.korail-watch",
-    "ProgramArguments": [caffeinate, "-i", watcher, "watch", "--arm", "--config", config],
+    "ProgramArguments": arguments,
     "WorkingDirectory": working_directory,
     "RunAtLoad": True,
     "KeepAlive": False,
@@ -48,7 +56,7 @@ PY
     echo "Uninstalled $label"
     ;;
   *)
-    echo "usage: $0 install [/absolute/path/to/trip.toml] | uninstall" >&2
+    echo "usage: $0 install [/absolute/path/to/trip.toml] [--continuous] | uninstall" >&2
     exit 2
     ;;
 esac
