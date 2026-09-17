@@ -4,7 +4,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -55,12 +55,13 @@ class Provider:
         self.calls = []
         self.reserve_calls = []
         self.remote = []
+        self.paid = []
 
     def reservations(self):
         return list(self.remote)
 
     def tickets(self):
-        return []
+        return list(self.paid)
 
     def search(self, requested, departure, arrival, after):
         self.calls.append((departure, arrival, after))
@@ -135,6 +136,16 @@ class EngineTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def _seed_hold(self, hold: Hold) -> None:
+        class Seed(Provider):
+            def reserve(self, selected, seat_class, adults):
+                return hold
+
+        self.assertEqual(
+            run(trip(), Seed([hold.train]), Notifier(), self.state, armed=True, once=True),
+            "reserved",
+        )
 
     def test_once_covers_all_routes_and_hourly_windows_without_reserving(self):
         provider = Provider()
@@ -590,6 +601,592 @@ class EngineTests(unittest.TestCase):
                 run(requested, recovered, Notifier(), state, armed=True, once=True),
                 "existing-hold",
             )
+
+    def test_continuous_requires_arm_and_default_hold_behavior_is_unchanged(self):
+        with self.assertRaisesRegex(ValueError, "requires armed"):
+            run(trip(), Provider(), Notifier(), self.state, continuous=True, once=True)
+        held = Hold("H1", train(), "2099-09-24T13:00:00+09:00", 50_000)
+        self._seed_hold(held)
+        provider = Provider()
+        self.assertEqual(run(trip(), provider, Notifier(), self.state, armed=True, once=True), "existing-hold")
+        self.assertEqual(provider.calls, [])
+
+    def test_continuous_unexpired_absence_and_missing_deadline_never_open_slot(self):
+        for deadline, expected in (
+            ("2099-09-24T13:00:00+09:00", "payment-pending"),
+            (None, "deadline-unknown"),
+        ):
+            with self.subTest(deadline=deadline), tempfile.TemporaryDirectory() as directory:
+                self.state = Path(directory) / "state"
+                self._seed_hold(Hold("H1", train(), deadline, 50_000))
+                with patch(
+                    "korail_watch.engine._now",
+                    return_value=datetime(2099, 9, 24, 12, 30, tzinfo=KST),
+                ):
+                    self.assertEqual(
+                        run(
+                            trip(),
+                            Provider(),
+                            Notifier(),
+                            self.state,
+                            armed=True,
+                            once=True,
+                            continuous=True,
+                        ),
+                        expected,
+                    )
+                snapshot = status(self.state)
+                self.assertEqual(snapshot["hold"]["reference"], "H1")
+                self.assertIsNone(snapshot["expiry_absence"])
+
+    def test_continuous_refreshes_same_pnr_deadline_and_keeps_paid_overlap_occupied(self):
+        original = Hold("H1", train(), "2099-09-24T12:00:00+09:00", 50_000)
+        refreshed = Hold("H1", train(), "2099-09-24T13:30:00+09:00", 50_000)
+        paid = Hold("SALE-1", train(), None, 50_000, paid=True)
+        self._seed_hold(original)
+        provider, notifier = Provider(), Notifier()
+        provider.remote, provider.paid = [refreshed], [paid]
+        with patch(
+            "korail_watch.engine._now",
+            return_value=datetime(2099, 9, 24, 12, 2, tzinfo=KST),
+        ):
+            self.assertEqual(
+                run(trip(), provider, notifier, self.state, armed=True, once=True, continuous=True),
+                "payment-pending",
+            )
+        snapshot = status(self.state)
+        self.assertEqual(snapshot["hold"]["deadline"], refreshed.deadline)
+        self.assertEqual(snapshot["paid_tickets"][0]["reference"], "SALE-1")
+        self.assertIn("payment is confirmed", notifier.messages[-1])
+        self.assertNotIn("payment deadline", notifier.messages[-1])
+
+        provider.remote = []
+        with patch(
+            "korail_watch.engine._now",
+            return_value=datetime(2099, 9, 24, 12, 3, tzinfo=KST),
+        ):
+            self.assertEqual(
+                run(trip(), provider, notifier, self.state, armed=True, once=True, continuous=True),
+                "paid",
+            )
+        self.assertIsNone(status(self.state)["hold"])
+
+    def test_continuous_paid_overlap_notifies_once_without_resetting_backoff(self):
+        held = Hold("H1", train(), "2099-09-24T13:00:00+09:00", 50_000)
+        paid = Hold("PRIVATE-SALE-REFERENCE", train(), None, 50_000, paid=True)
+        self._seed_hold(held)
+        provider = Provider()
+        provider.remote, provider.paid = [held], [paid]
+        notifier = Notifier(TransientError(retry_after=600))
+        clock = [datetime(2099, 9, 24, 12, 0, tzinfo=KST)]
+        sleeps = [0]
+
+        def advance(seconds):
+            sleeps[0] += 1
+            clock[0] = (
+                datetime(2099, 9, 24, 18, 0, tzinfo=KST)
+                if sleeps[0] == 2
+                else clock[0] + timedelta(seconds=seconds)
+            )
+
+        with patch("korail_watch.engine._now", side_effect=lambda: clock[0]), patch(
+            "korail_watch.engine.time.sleep", side_effect=advance
+        ):
+            self.assertEqual(
+                run(trip(), provider, notifier, self.state, armed=True, continuous=True),
+                "cutoff",
+            )
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertNotIn("PRIVATE-SALE-REFERENCE", notifier.messages[0])
+        self.assertEqual(status(self.state)["notifications_pending"], 1)
+
+    def test_continuous_verified_expiry_archives_and_resumes_in_same_process(self):
+        held = Hold("H1", train(), "2099-09-24T12:00:00+09:00", 50_000)
+        self._seed_hold(held)
+        clock = [datetime(2099, 9, 24, 12, 2, tzinfo=KST)]
+
+        def advance(seconds):
+            clock[0] += timedelta(seconds=seconds)
+
+        notifier = Notifier()
+        with patch("korail_watch.engine._now", side_effect=lambda: clock[0]), patch(
+            "korail_watch.engine.time.sleep", side_effect=advance
+        ):
+            self.assertEqual(
+                run(
+                    trip(),
+                    Provider(),
+                    notifier,
+                    self.state,
+                    armed=True,
+                    continuous=True,
+                    max_cycles=1,
+                ),
+                "not-found",
+            )
+        snapshot = status(self.state)
+        self.assertIsNone(snapshot["hold"])
+        self.assertEqual(snapshot["expired_holds"][0]["hold"]["reference"], "H1")
+        evidence = snapshot["expired_holds"][0]["verification"]
+        first = datetime.fromisoformat(evidence["first_absent_at"])
+        second = datetime.fromisoformat(evidence["confirmed_absent_at"])
+        self.assertGreaterEqual((second - first).total_seconds(), 30)
+        self.assertTrue(any("searching may resume" in message for message in notifier.messages))
+
+    def test_continuous_expiry_evidence_survives_restart_and_transient_resets_it(self):
+        held = Hold("H1", train(), "2099-09-24T12:00:00+09:00", 50_000)
+        self._seed_hold(held)
+        now = datetime(2099, 9, 24, 12, 2, tzinfo=KST)
+        with patch("korail_watch.engine._now", return_value=now):
+            self.assertEqual(
+                run(trip(), Provider(), Notifier(), self.state, armed=True, once=True, continuous=True),
+                "expiry-verifying",
+            )
+        self.assertIsNotNone(status(self.state)["expiry_absence"])
+
+        class Unavailable(Provider):
+            def reservations(self):
+                raise TransientError(retry_after=7)
+
+        with patch("korail_watch.engine._now", return_value=now + timedelta(seconds=31)):
+            self.assertEqual(
+                run(trip(), Unavailable(), Notifier(), self.state, armed=True, once=True, continuous=True),
+                "payment-incomplete",
+            )
+        self.assertIsNone(status(self.state)["expiry_absence"])
+
+        with patch("korail_watch.engine._now", return_value=now + timedelta(seconds=32)):
+            self.assertEqual(
+                run(trip(), Provider(), Notifier(), self.state, armed=True, once=True, continuous=True),
+                "expiry-verifying",
+            )
+        with patch("korail_watch.engine._now", return_value=now + timedelta(seconds=63)):
+            self.assertEqual(
+                run(trip(), Provider(), Notifier(), self.state, armed=True, once=True, continuous=True),
+                "expired",
+            )
+        self.assertEqual(status(self.state)["expired_holds"][0]["hold"]["reference"], "H1")
+
+    def test_continuous_unknown_and_conflicting_unpaid_fail_closed_with_notice(self):
+        held = Hold("H1", train(), "2099-09-24T12:00:00+09:00", 50_000)
+        for provider, reason in (
+            (
+                type(
+                    "Unknown",
+                    (Provider,),
+                    {"reservations": lambda self: (_ for _ in ()).throw(AmbiguousReservation())},
+                )(),
+                "account-ambiguous",
+            ),
+            (Provider(), "conflicting-unpaid-record"),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                self.state = Path(directory) / "state"
+                self._seed_hold(held)
+                if reason == "conflicting-unpaid-record":
+                    provider.remote = [held, Hold("OTHER", train(key="KTX-2", dep_time="13:00"), None, None)]
+                notifier = Notifier()
+                with patch(
+                    "korail_watch.engine._now",
+                    return_value=datetime(2099, 9, 24, 12, 2, tzinfo=KST),
+                ):
+                    self.assertEqual(
+                        run(
+                            trip(),
+                            provider,
+                            notifier,
+                            self.state,
+                            armed=True,
+                            once=True,
+                            continuous=True,
+                        ),
+                        "ambiguous",
+                    )
+                snapshot = status(self.state)
+                self.assertEqual(snapshot["state"], "ambiguous")
+                self.assertEqual(snapshot["expiry_unknown"]["reason"], reason)
+                self.assertIn("No new booking", notifier.messages[-1])
+
+    def test_continuous_preflight_blocks_unpaid_record_appearing_after_search(self):
+        candidate = train()
+        other = Hold(
+            "OTHER",
+            train(key="OTHER", departure="부산", arrival="대구"),
+            None,
+            None,
+        )
+
+        class Appears(Provider):
+            def __init__(self):
+                super().__init__([candidate])
+                self.reads = 0
+
+            def reservations(self):
+                self.reads += 1
+                return [] if self.reads == 1 else [other]
+
+        provider = Appears()
+        self.assertEqual(
+            run(
+                trip(),
+                provider,
+                Notifier(),
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+            "ambiguous",
+        )
+        self.assertEqual(provider.reserve_calls, [])
+        self.assertEqual(status(self.state)["reconciliation_unknown"]["reason"], "other-unpaid-record")
+
+    def test_continuous_preflight_retry_stops_at_cutoff_without_writing(self):
+        candidate = train(dep_time="17:59")
+        clock = [datetime(2099, 9, 24, 17, 59, 50, tzinfo=KST)]
+
+        class Delayed(Provider):
+            def __init__(self):
+                super().__init__([candidate])
+                self.reads = 0
+
+            def reservations(self):
+                self.reads += 1
+                if self.reads == 2:
+                    raise TransientError(retry_after=600)
+                return []
+
+        def advance(seconds):
+            clock[0] += timedelta(seconds=seconds)
+
+        provider = Delayed()
+        with patch("korail_watch.engine._now", side_effect=lambda: clock[0]), patch(
+            "korail_watch.engine.time.sleep", side_effect=advance
+        ):
+            self.assertEqual(
+                run(
+                    trip(),
+                    provider,
+                    Notifier(),
+                    self.state,
+                    armed=True,
+                    continuous=True,
+                ),
+                "cutoff",
+            )
+        self.assertEqual(provider.reserve_calls, [])
+        self.assertIsNone(status(self.state)["intent"])
+
+    def test_continuous_search_retries_pending_notification_nonblocking(self):
+        selected = train()
+        self._seed_hold(Hold("H1", selected, "2099-09-24T13:00:00+09:00", 50_000))
+        paid = Hold("PRIVATE-SALE-REFERENCE", selected, None, 50_000, paid=True)
+        clock = [datetime(2099, 9, 24, 12, 0, tzinfo=KST)]
+
+        class Empty(Provider):
+            def __init__(self):
+                super().__init__()
+                self.paid = [paid]
+
+            def search(self, requested, departure, arrival, after):
+                clock[0] += timedelta(seconds=1)
+                return super().search(requested, departure, arrival, after)
+
+        notifier = Notifier(TransientError(retry_after=1))
+        with patch("korail_watch.engine._now", side_effect=lambda: clock[0]):
+            self.assertEqual(
+                run(
+                    trip(),
+                    Empty(),
+                    notifier,
+                    self.state,
+                    armed=True,
+                    continuous=True,
+                    max_cycles=1,
+                ),
+                "not-found",
+            )
+        self.assertEqual(len(notifier.messages), 2)
+        self.assertEqual(status(self.state)["notifications_pending"], 0)
+
+    def test_continuous_restart_adopts_paid_unpaid_overlap_without_pay_instruction(self):
+        unpaid = Hold("H1", train(), "2099-09-24T13:00:00+09:00", 50_000)
+        paid = Hold("PRIVATE-SALE-REFERENCE", train(), None, 50_000, paid=True)
+        provider, notifier = Provider(), Notifier()
+        provider.remote, provider.paid = [unpaid], [paid]
+        self.assertEqual(
+            run(
+                trip(),
+                provider,
+                notifier,
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+            "existing-hold",
+        )
+        snapshot = status(self.state)
+        self.assertEqual(snapshot["hold"]["reference"], "H1")
+        self.assertEqual(snapshot["paid_tickets"][0]["reference"], "PRIVATE-SALE-REFERENCE")
+        self.assertIn("payment is confirmed", notifier.messages[-1])
+        self.assertNotIn("payment deadline", notifier.messages[-1])
+        self.assertNotIn("PRIVATE-SALE-REFERENCE", notifier.messages[-1])
+
+        restarted = Notifier()
+        self.assertEqual(
+            run(
+                trip(),
+                provider,
+                restarted,
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+            "payment-pending",
+        )
+        self.assertEqual(restarted.messages, [])
+
+    def test_continuous_paid_train_is_excluded_and_one_alternative_can_be_held(self):
+        paid_train = train(key="PAID", dep_time="12:30")
+        alternative = train(key="ALT", dep_time="13:00")
+        self._seed_hold(Hold("H1", paid_train, "2099-09-24T12:20:00+09:00", 50_000))
+        paid = Hold("SALE-1", paid_train, None, 50_000, paid=True)
+        clock = [datetime(2099, 9, 24, 12, 0, tzinfo=KST)]
+
+        class Alternative(Provider):
+            def __init__(self):
+                super().__init__([paid_train, alternative])
+                self.paid = [paid]
+
+            def reserve(self, selected, kind, adults):
+                self.reserve_calls.append((selected, kind, adults))
+                result = Hold("H2", selected, "2099-09-24T14:00:00+09:00", 50_000)
+                self.remote = [result]
+                clock[0] = datetime(2099, 9, 24, 18, 0, tzinfo=KST)
+                return result
+
+        provider = Alternative()
+        with patch("korail_watch.engine._now", side_effect=lambda: clock[0]):
+            self.assertEqual(
+                run(
+                    trip(),
+                    provider,
+                    Notifier(),
+                    self.state,
+                    armed=True,
+                    continuous=True,
+                    max_cycles=1,
+                ),
+                "cutoff",
+            )
+        self.assertEqual([call[0].key for call in provider.reserve_calls], ["ALT"])
+        snapshot = status(self.state)
+        self.assertEqual(snapshot["hold"]["reference"], "H2")
+        self.assertEqual(snapshot["paid_tickets"][0]["reference"], "SALE-1")
+
+    def test_continuous_waitlist_allocation_enters_expiry_monitor(self):
+        candidate = train(general=False, special=False, waitlist=True)
+        requested = trip(allow_waitlist=True)
+        first = QueueProvider([candidate])
+        self.assertEqual(run(requested, first, Notifier(), self.state, armed=True, once=True), "queued")
+        allocated = Hold("Q1", candidate, "2099-09-24T12:00:00+09:00", 50_000)
+        clock = [datetime(2099, 9, 24, 12, 2, tzinfo=KST)]
+
+        class AllocatesThenExpires(QueueProvider):
+            def __init__(self):
+                super().__init__()
+                self.reads = 0
+
+            def reservations(self):
+                self.reads += 1
+                return [allocated] if self.reads == 1 else []
+
+        def advance(seconds):
+            clock[0] += timedelta(seconds=seconds)
+
+        with patch("korail_watch.engine._now", side_effect=lambda: clock[0]), patch(
+            "korail_watch.engine.time.sleep", side_effect=advance
+        ):
+            self.assertEqual(
+                run(
+                    requested,
+                    AllocatesThenExpires(),
+                    Notifier(),
+                    self.state,
+                    armed=True,
+                    continuous=True,
+                    max_cycles=1,
+                ),
+                "not-found",
+            )
+        self.assertEqual(status(self.state)["expired_holds"][0]["hold"]["reference"], "Q1")
+
+    def test_continuous_waitlist_fast_payment_uses_exact_train_not_reference(self):
+        candidate = train(general=False, special=False, waitlist=True)
+        alternative = train(key="ALT", dep_time="13:00")
+        requested = trip(allow_waitlist=True)
+        first = QueueProvider([candidate])
+        self.assertEqual(run(requested, first, Notifier(), self.state, armed=True, once=True), "queued")
+
+        clock = [datetime(2099, 9, 24, 12, 0, tzinfo=KST)]
+
+        class Alternative(QueueProvider):
+            def __init__(self):
+                super().__init__([candidate, alternative])
+                self.paid = [Hold("PRIVATE-SALE-REFERENCE", candidate, None, 50_000, paid=True)]
+
+            def reserve(self, selected, kind, adults):
+                self.reserve_calls.append((selected, kind, adults))
+                result = Hold("H2", selected, "2099-09-24T14:00:00+09:00", 50_000)
+                self.remote = [result]
+                clock[0] = datetime(2099, 9, 24, 18, 0, tzinfo=KST)
+                return result
+
+        provider, notifier = Alternative(), Notifier()
+        with patch("korail_watch.engine._now", side_effect=lambda: clock[0]):
+            self.assertEqual(
+                run(
+                    requested,
+                    provider,
+                    notifier,
+                    self.state,
+                    armed=True,
+                    continuous=True,
+                    max_cycles=1,
+                ),
+                "cutoff",
+            )
+        snapshot = status(self.state)
+        self.assertIsNone(snapshot["queue"])
+        self.assertIsNone(snapshot["queue_unknown"])
+        self.assertEqual(snapshot["hold"]["reference"], "H2")
+        self.assertEqual(snapshot["paid_tickets"][0]["reference"], "PRIVATE-SALE-REFERENCE")
+        self.assertEqual([call[0].key for call in provider.reserve_calls], ["ALT"])
+        self.assertNotIn("PRIVATE-SALE-REFERENCE", " ".join(notifier.messages))
+
+    def test_queue_allocation_paid_overlap_never_sends_payment_deadline(self):
+        candidate = train(general=False, special=False, waitlist=True)
+        requested = trip(allow_waitlist=True)
+        first = QueueProvider([candidate])
+        self.assertEqual(run(requested, first, Notifier(), self.state, armed=True, once=True), "queued")
+
+        allocated = Hold("Q1", candidate, "2099-09-24T13:00:00+09:00", 50_000)
+        paid = Hold("PRIVATE-SALE-REFERENCE", candidate, None, 50_000, paid=True)
+        provider, notifier = QueueProvider(), Notifier()
+        provider.remote, provider.paid = [allocated], [paid]
+        self.assertEqual(
+            run(
+                requested,
+                provider,
+                notifier,
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+            "allocated",
+        )
+        snapshot = status(self.state)
+        self.assertEqual(snapshot["hold"]["reference"], "Q1")
+        self.assertEqual(snapshot["paid_tickets"][0]["reference"], "PRIVATE-SALE-REFERENCE")
+        self.assertIn("payment is confirmed", notifier.messages[-1])
+        self.assertNotIn("payment deadline", notifier.messages[-1])
+
+    def test_default_queue_fast_payment_is_terminal_not_continuing(self):
+        candidate = train(general=False, special=False, waitlist=True)
+        requested = trip(allow_waitlist=True)
+        first = QueueProvider([candidate])
+        self.assertEqual(run(requested, first, Notifier(), self.state, armed=True, once=True), "queued")
+
+        provider, notifier = QueueProvider(), Notifier()
+        provider.paid = [Hold("PRIVATE-SALE-REFERENCE", candidate, None, 50_000, paid=True)]
+        self.assertEqual(
+            run(requested, provider, notifier, self.state, armed=True, once=True),
+            "paid",
+        )
+        self.assertIn("already confirmed", notifier.messages[-1])
+        self.assertNotIn("continuing", notifier.messages[-1])
+        self.assertNotIn("PRIVATE-SALE-REFERENCE", notifier.messages[-1])
+
+    def test_default_reconciliation_paid_overlap_never_sends_payment_deadline(self):
+        unpaid = Hold("H1", train(), "2099-09-24T13:00:00+09:00", 50_000)
+        paid = Hold("PRIVATE-SALE-REFERENCE", train(), None, 50_000, paid=True)
+        provider, notifier = Provider(), Notifier()
+        provider.remote, provider.paid = [unpaid], [paid]
+        self.assertEqual(
+            run(trip(), provider, notifier, self.state, armed=True, once=True),
+            "existing-hold",
+        )
+        self.assertIn("payment is confirmed", notifier.messages[-1])
+        self.assertNotIn("payment deadline", notifier.messages[-1])
+        self.assertNotIn("PRIVATE-SALE-REFERENCE", notifier.messages[-1])
+
+    def test_waitlist_intent_paid_overlap_never_sends_payment_deadline(self):
+        candidate = train(general=False, special=False, waitlist=True)
+        requested = trip(allow_waitlist=True)
+
+        class Crash(QueueProvider):
+            def reserve(self, selected, kind, adults):
+                raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            run(requested, Crash([candidate]), Notifier(), self.state, armed=True, once=True)
+
+        allocated = Hold("Q1", candidate, "2099-09-24T13:00:00+09:00", 50_000)
+        paid = Hold("PRIVATE-SALE-REFERENCE", candidate, None, 50_000, paid=True)
+        provider, notifier = QueueProvider(), Notifier()
+        provider.remote, provider.paid = [allocated], [paid]
+        self.assertEqual(
+            run(requested, provider, notifier, self.state, armed=True, once=True),
+            "allocated",
+        )
+        self.assertIn("payment is confirmed", notifier.messages[-1])
+        self.assertNotIn("payment deadline", notifier.messages[-1])
+        self.assertNotIn("PRIVATE-SALE-REFERENCE", notifier.messages[-1])
+
+    def test_continuous_waitlist_rejects_another_unpaid_account_record(self):
+        candidate = train(general=False, special=False, waitlist=True)
+        requested = trip(allow_waitlist=True)
+        first = QueueProvider([candidate])
+        self.assertEqual(run(requested, first, Notifier(), self.state, armed=True, once=True), "queued")
+
+        provider = QueueProvider()
+        provider.remote = [
+            Hold("Q1", candidate, None, None, kind="waitlist"),
+            Hold("OTHER", train(key="OTHER", dep_time="13:00"), None, None),
+        ]
+        self.assertEqual(
+            run(
+                requested,
+                provider,
+                Notifier(),
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+            "ambiguous",
+        )
+        snapshot = status(self.state)
+        self.assertEqual(snapshot["queue_unknown"]["reason"], "conflicting-unpaid-record")
+        self.assertIsNotNone(snapshot["queue"])
+
+    def test_continuous_cutoff_preserves_active_hold_without_account_read(self):
+        held = Hold("H1", train(), "2099-09-24T17:00:00+09:00", 50_000)
+        self._seed_hold(held)
+        provider = Provider()
+        with patch(
+            "korail_watch.engine._now",
+            return_value=datetime(2099, 9, 24, 18, 0, tzinfo=KST),
+        ):
+            self.assertEqual(
+                run(trip(), provider, Notifier(), self.state, armed=True, continuous=True),
+                "cutoff",
+            )
+        self.assertEqual(status(self.state)["hold"]["reference"], "H1")
+        self.assertEqual(provider.calls, [])
 
     def test_ambiguous_reconciliation_is_durable_without_local_intent(self):
         class Uncertain(Provider):

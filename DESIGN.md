@@ -51,6 +51,9 @@ mode may archive a missed-deadline hold and resume only after deadline plus grac
 and two complete, separated account snapshots prove its PNR absent. It preserves
 paid tickets as exclusions and permits no more than one active unpaid hold or
 waitlist while seeking alternatives through the trip cutoff.
+The one-unpaid policy relies on refreshed account snapshots rather than a
+provider-wide lock against simultaneous manual reservations. Unexpected extra
+unpaid records, authentication blocks, or unknown state stop for operator review.
 Telegram failures must not trigger another hold. Keep notification pending and
 retry independently with bounded backoff. Include actual provider payment
 deadline, or clearly say unavailable and request immediate app check. Never

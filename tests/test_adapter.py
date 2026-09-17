@@ -88,9 +88,13 @@ class RawReservation(RawTrain):
 class RawTicket(RawTrain):
     price = 23700
     seat_no_count = 1
+    sale_info1 = "001"
+    sale_info2 = "20260917"
+    sale_info3 = "000001"
+    sale_info4 = "99999"
 
     def get_ticket_no(self):
-        return "ticket-1"
+        return "-".join((self.sale_info1, self.sale_info2, self.sale_info3, self.sale_info4))
 
 
 class FakeClient:
@@ -128,6 +132,57 @@ def provider(client=None):
     result._sdk = SDK
     result._client = client or FakeClient()
     return result
+
+
+def paid_tickets(adapter, *raw_tickets):
+    def read():
+        adapter._session.ticket_status = {
+            item.get_ticket_no(): ("paid-pnr", korail._raw_key(item)) for item in raw_tickets
+        }
+        adapter._session.ticket_complete = True
+        return list(raw_tickets)
+
+    adapter._client.tickets = read
+
+
+def ticket_row(**changes):
+    row = {
+        "h_pnr_no": "paid-pnr-1",
+        "h_psg_tp_cd": "1",
+        "h_seat_cnt": "1",
+        "h_orgtk_wct_no": "001",
+        "h_orgtk_ret_sale_dt": "20260917",
+        "h_orgtk_sale_sqno": "000001",
+        "h_orgtk_ret_pwd": "99999",
+        "h_trn_clsf_cd": "100",
+        "h_trn_clsf_nm": "KTX",
+        "h_trn_gp_cd": "100",
+        "h_trn_no": "001",
+        "h_dpt_rs_stn_nm": "서울",
+        "h_dpt_rs_stn_cd": "0001",
+        "h_dpt_dt": "20260924",
+        "h_dpt_tm": "120000",
+        "h_arv_rs_stn_nm": "대전",
+        "h_arv_rs_stn_cd": "0010",
+        "h_arv_dt": "20260924",
+        "h_arv_tm": "130000",
+        "h_run_dt": "20260924",
+        "h_rcvd_amt": "23700",
+        "h_srcar_no": "5",
+        "h_seat_no": "5A",
+        "h_seat_no_end": "5A",
+        "h_buy_ps_nm": "테스트",
+        "h_orgtk_sale_dt": "20260917",
+    }
+    row.update(changes)
+    return row
+
+
+def ticket_list_payload(row):
+    return {
+        "strResult": "SUCC",
+        "reservation_list": [{"ticket_list": [{"train_info": [row]}]}],
+    }
 
 
 class ProviderTests(unittest.TestCase):
@@ -198,10 +253,11 @@ class ProviderTests(unittest.TestCase):
 
     def test_reconciliation_distinguishes_unpaid_and_paid(self):
         adapter = provider()
+        paid_tickets(adapter, RawTicket())
         reservations, tickets = adapter.reservations(), adapter.tickets()
         self.assertEqual([False], [item.paid for item in reservations])
         self.assertEqual([True], [item.paid for item in tickets])
-        self.assertEqual("ticket-1", tickets[0].reference)
+        self.assertEqual("001-20260917-000001-99999", tickets[0].reference)
         self.assertIsNone(tickets[0].deadline)
 
     def test_reconciliation_distinguishes_waitlist_allocation_and_unknown(self):
@@ -609,10 +665,155 @@ class ProviderTests(unittest.TestCase):
     def test_paid_zero_seats_is_not_assumed_to_be_one_standing_adult(self):
         raw = RawTicket()
         raw.seat_no_count = 0
-        client = FakeClient()
-        client.tickets = lambda: [raw]
+        adapter = provider()
+        paid_tickets(adapter, raw)
         with self.assertRaises(AmbiguousReservation):
-            provider(client).tickets()
+            adapter.tickets()
+
+    def test_pinned_sdk_paid_list_preserves_full_route_and_four_part_reference(self):
+        import korail2
+
+        row = ticket_row()
+        calls = []
+
+        def response(payload, url):
+            result = requests.Response()
+            result.status_code = 200
+            result.url = url
+            result._content = json.dumps(payload).encode()
+            result.encoding = "utf-8"
+            return result
+
+        def request(_session, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith(".myTicket.MyTicketList"):
+                self.assertEqual("1", kwargs["params"]["txtIndex"])
+                self.assertEqual("1", kwargs["params"]["h_page_no"])
+                return response(ticket_list_payload(row), url)
+            if url.endswith(".refunds.SelTicketInfo"):
+                return response(
+                    {
+                        "strResult": "SUCC",
+                        "ticket_infos": {
+                            "ticket_info": [{"tk_seat_info": [{"h_seat_no": "5A"}]}]
+                        },
+                    },
+                    url,
+                )
+            raise AssertionError(f"unexpected offline request: {url}")
+
+        adapter = KorailProvider()
+        client = korail2.Korail("member", "password", auto_login=False, want_feedback=False)
+        client._session = adapter._session
+        adapter._sdk, adapter._client = korail2, client
+
+        with patch.object(requests.Session, "request", request), patch(
+            "korail_watch.korail.time.sleep"
+        ):
+            holds = adapter.tickets()
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual("001-20260917-000001-99999", holds[0].reference)
+        self.assertEqual("2026-09-24|100|001|서울|12:00|대전|13:00", holds[0].train.key)
+        self.assertTrue(holds[0].paid)
+        self.assertEqual("seated", holds[0].kind)
+
+    def test_pinned_sdk_definitive_empty_ticket_responses_are_authoritative(self):
+        import korail2
+
+        payloads = (
+            {
+                "h_msg_cd": "WRT300005",
+                "h_msg_txt": "조회자료가 없습니다.",
+                "strResult": "SUCC",
+                "tickets": [],
+            },
+            {"h_msg_cd": "P100", "h_msg_txt": "no results", "strResult": "FAIL"},
+            {"h_msg_cd": "WRG000000", "h_msg_txt": "no results", "strResult": "FAIL"},
+        )
+        for payload in payloads:
+            with self.subTest(code=payload["h_msg_cd"]):
+                response = requests.Response()
+                response.status_code = 200
+                response.url = "https://smart.letskorail.com/tickets"
+                response._content = json.dumps(payload).encode()
+                response.encoding = "utf-8"
+                adapter = KorailProvider()
+                client = korail2.Korail(
+                    "member", "password", auto_login=False, want_feedback=False
+                )
+                client._session = adapter._session
+                adapter._sdk, adapter._client = korail2, client
+                korail._NEXT_REQUEST = 0.0
+
+                with patch.object(requests.Session, "request", return_value=response):
+                    self.assertEqual([], adapter.tickets())
+
+    def test_paid_list_fails_closed_before_sdk_can_truncate_records(self):
+        import copy
+        import korail2
+
+        base = ticket_list_payload(ticket_row())
+        cases = {}
+        cases["missing-pnr"] = copy.deepcopy(base)
+        del cases["missing-pnr"]["reservation_list"][0]["ticket_list"][0]["train_info"][0][
+            "h_pnr_no"
+        ]
+        cases["non-adult"] = copy.deepcopy(base)
+        cases["non-adult"]["reservation_list"][0]["ticket_list"][0]["train_info"][0][
+            "h_psg_tp_cd"
+        ] = "2"
+        cases["group"] = copy.deepcopy(base)
+        cases["group"]["reservation_list"][0]["ticket_list"][0]["train_info"][0][
+            "h_seat_cnt"
+        ] = "2"
+        cases["multi-leg"] = copy.deepcopy(base)
+        cases["multi-leg"]["reservation_list"][0]["ticket_list"][0]["train_info"].append(
+            ticket_row(h_trn_no="002")
+        )
+        cases["duplicate-reference"] = copy.deepcopy(base)
+        cases["duplicate-reference"]["reservation_list"].append(
+            copy.deepcopy(cases["duplicate-reference"]["reservation_list"][0])
+        )
+
+        for name, payload in cases.items():
+            with self.subTest(case=name):
+                def response(body, url):
+                    result = requests.Response()
+                    result.status_code = 200
+                    result.url = url
+                    result._content = json.dumps(body).encode()
+                    result.encoding = "utf-8"
+                    return result
+
+                def request(_session, method, url, **kwargs):
+                    if url.endswith(".myTicket.MyTicketList"):
+                        return response(payload, url)
+                    if url.endswith(".refunds.SelTicketInfo"):
+                        return response(
+                            {
+                                "strResult": "SUCC",
+                                "ticket_infos": {
+                                    "ticket_info": [
+                                        {"tk_seat_info": [{"h_seat_no": "5A"}]}
+                                    ]
+                                },
+                            },
+                            url,
+                        )
+                    raise AssertionError(f"unexpected offline request: {url}")
+
+                adapter = KorailProvider()
+                client = korail2.Korail(
+                    "member", "password", auto_login=False, want_feedback=False
+                )
+                client._session = adapter._session
+                adapter._sdk, adapter._client = korail2, client
+                korail._NEXT_REQUEST = 0.0
+                with patch.object(requests.Session, "request", request), patch(
+                    "korail_watch.korail.time.sleep"
+                ), self.assertRaises(AmbiguousReservation):
+                    adapter.tickets()
 
     def test_session_paces_every_request_and_applies_timeout(self):
         clock = [100.0]

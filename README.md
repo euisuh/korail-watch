@@ -82,7 +82,8 @@ minutes. Its final line is the termination outcome; `not-found` means the full
 configured window was checked, not that the command hung.
 
 No live reservation is attempted until `--arm` is present. The default remains
-single-result mode and stops after the first queue, hold, or ticket:
+single-result mode and stops after the first hold or ticket; a waitlist is
+monitored for allocation:
 
 ```sh
 caffeinate -i korail-watch watch --arm --config trip.toml
@@ -102,6 +103,13 @@ after its provider deadline plus a 60-second grace and two complete account
 snapshots, at least 30 seconds apart, prove the known PNR absent with no
 conflicting unpaid record. Missing deadlines, read errors, identity conflicts,
 or ambiguous state stop new writes rather than guessing.
+
+The one-unpaid limit is enforced from refreshed account snapshots, not a
+server-wide lock against simultaneous actions in the official app. Avoid creating
+other reservations manually while the watcher is armed; paying the current hold
+is supported. Unexpected additional unpaid records, authentication blocks, or
+unknown state stop the watcher for manual review. Continuous mode never turns
+these safety stops into blind restarts.
 
 The armed command logs in, sends a Telegram preflight message, and then starts
 watching. `caffeinate -i` prevents idle system sleep while the terminal process

@@ -148,6 +148,11 @@ def _message(hold: Hold) -> str:
             f"{hold.train.date} {hold.train.dep_time}; queued only, no seat is guaranteed. "
             "Check the Korail app; payment is not due unless allocation is confirmed."
         )
+    if hold.paid:
+        return (
+            f"Korail paid ticket: {hold.train.departure} → {hold.train.arrival}, "
+            f"{hold.train.date} {hold.train.dep_time}; payment is already confirmed."
+        )
     payment = hold.deadline or "unavailable; check the Korail app immediately"
     price = f"; price {hold.price:,} KRW" if hold.price is not None else ""
     return (
@@ -160,7 +165,11 @@ def _message(hold: Hold) -> str:
 def _confirm(db: sqlite3.Connection, hold: Hold) -> None:
     with db:
         _set(db, "hold", _hold_data(hold))
-        db.execute("DELETE FROM state WHERE key IN ('intent', 'ambiguous_hold', 'queue', 'queue_unknown')")
+        db.execute(
+            "DELETE FROM state WHERE key IN "
+            "('intent', 'ambiguous_hold', 'queue', 'queue_unknown', 'expiry_absence', "
+            "'expiry_unknown', 'paid_overlap')"
+        )
         db.execute(
             "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
             (_message(hold),),
@@ -174,6 +183,44 @@ def _confirm_queue(db: sqlite3.Connection, hold: Hold) -> None:
         db.execute(
             "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
             (_message(hold),),
+        )
+
+
+def _confirm_paid_overlap(
+    db: sqlite3.Connection,
+    hold: Hold,
+    paid: Hold,
+    *,
+    continuous: bool = True,
+) -> None:
+    recorded = _get(db, "paid_tickets") or []
+    if not isinstance(recorded, list):
+        raise TypeError("paid ticket record is invalid")
+    known = [_hold_from_data(item) for item in recorded]
+    if not any(
+        item.reference == paid.reference and _same_train(item.train, paid.train)
+        for item in known
+    ):
+        recorded.append(_hold_data(paid))
+    with db:
+        _set(db, "paid_tickets", recorded)
+        _set(db, "hold", _hold_data(hold))
+        _set(db, "paid_overlap", {"hold_reference": hold.reference, "train": _train_data(hold.train)})
+        db.execute(
+            "DELETE FROM state WHERE key IN "
+            "('intent', 'ambiguous_hold', 'queue', 'queue_unknown', 'expiry_absence', 'expiry_unknown')"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+            (
+                f"Korail payment is confirmed for {hold.train.departure} → {hold.train.arrival}, "
+                f"{hold.train.date} {hold.train.dep_time}; "
+                + (
+                    "waiting for the unpaid reservation record to clear before continuing."
+                    if continuous
+                    else "no further payment action is needed."
+                ),
+            ),
         )
 
 
@@ -199,6 +246,60 @@ def _preserve_queue_unknown(db: sqlite3.Connection, queued: dict, remote: list[H
             (
                 f"Korail waitlist {queued['reference']} can no longer be confirmed ({reason}). "
                 "Do not create another booking automatically; check the Korail app.",
+            ),
+        )
+
+
+def _reset_expiry_absence(db: sqlite3.Connection) -> None:
+    with db:
+        db.execute("DELETE FROM state WHERE key = 'expiry_absence'")
+
+
+def _preserve_expiry_unknown(db: sqlite3.Connection, hold, reason: str) -> None:
+    reference = hold.get("reference", "unknown") if isinstance(hold, dict) else "unknown"
+    with db:
+        db.execute("DELETE FROM state WHERE key = 'expiry_absence'")
+        _set(
+            db,
+            "expiry_unknown",
+            {"observed_at": _now().isoformat(), "reason": reason, "hold": hold},
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+            (
+                f"Korail reservation {reference} monitoring stopped "
+                f"({reason}); check the official Korail app. No new booking will be attempted.",
+            ),
+        )
+
+
+def _archive_expired(db: sqlite3.Connection, hold: dict, first_absent_at: str) -> None:
+    archived = _get(db, "expired_holds") or []
+    if not isinstance(archived, list):
+        raise TypeError("expired hold archive is invalid")
+    now = _now().isoformat()
+    archived.append(
+        {
+            "hold": hold,
+            "verification": {
+                "first_absent_at": first_absent_at,
+                "confirmed_absent_at": now,
+                "known_reference_absent": True,
+                "matching_account_record_absent": True,
+            },
+        }
+    )
+    with db:
+        _set(db, "expired_holds", archived)
+        db.execute(
+            "DELETE FROM state WHERE key IN "
+            "('hold', 'expiry_absence', 'expiry_unknown', 'paid_overlap')"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+            (
+                f"Korail reservation {hold['reference']} expired and two account checks confirmed "
+                "it absent; searching may resume.",
             ),
         )
 
@@ -272,6 +373,11 @@ def _past_cutoff(trip: Trip) -> bool:
     return now.date() > trip_date or (now.date() == trip_date and now.strftime("%H:%M") >= trip.end)
 
 
+def _until_cutoff(trip: Trip) -> float:
+    cutoff = datetime.fromisoformat(f"{trip.date}T{trip.end}:00").replace(tzinfo=KST)
+    return max(0.0, (cutoff - _now()).total_seconds())
+
+
 def _supported_modes(provider) -> frozenset[str]:
     modes = getattr(provider, "supported_modes", frozenset(("general", "special")))
     allowed = {"general", "special", "waitlist", "standing", "mixed"}
@@ -290,13 +396,287 @@ def _remote_holds(provider) -> list[Hold]:
     return reservations + tickets
 
 
-def _monitor_queue(db: sqlite3.Connection, provider, notifier, *, wait: bool) -> str:
-    queued = _get(db, "queue")
+def _record_paid(
+    db: sqlite3.Connection,
+    paid: list[Hold],
+    *,
+    continuing: bool = False,
+    clear_hold: bool = False,
+    clear_queue: bool = False,
+) -> None:
+    recorded = _get(db, "paid_tickets") or []
+    if not isinstance(recorded, list):
+        raise TypeError("paid ticket record is invalid")
+    known = [_hold_from_data(item) for item in recorded]
+    for ticket in paid:
+        if not any(
+            item.reference == ticket.reference and _same_train(item.train, ticket.train)
+            for item in known
+        ):
+            recorded.append(_hold_data(ticket))
+            known.append(ticket)
+    with db:
+        _set(db, "paid_tickets", recorded)
+        if clear_hold:
+            db.execute(
+                "DELETE FROM state WHERE key IN "
+                "('hold', 'expiry_absence', 'expiry_unknown', 'paid_overlap')"
+            )
+        if clear_queue:
+            db.execute("DELETE FROM state WHERE key IN ('queue', 'queue_unknown', 'paid_overlap')")
+        if continuing:
+            ticket = paid[0]
+            db.execute(
+                "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+                (
+                    f"Korail payment is confirmed for {ticket.train.departure} → "
+                    f"{ticket.train.arrival}, {ticket.train.date} {ticket.train.dep_time}; "
+                    "continuing to watch for one alternative. No further payment action is needed.",
+                ),
+            )
+
+
+def _paid_train(db: sqlite3.Connection, train: Train) -> bool:
+    return any(
+        _same_train(_hold_from_data(item).train, train)
+        for item in (_get(db, "paid_tickets") or [])
+    )
+
+
+def _preserve_account_unknown(db: sqlite3.Connection, reason: str, remote: list[Hold]) -> None:
+    with db:
+        _set(
+            db,
+            "reconciliation_unknown",
+            {
+                "created_at": _now().isoformat(),
+                "reason": reason,
+                "remote": [_hold_data(hold) for hold in remote],
+            },
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+            (
+                f"Korail continuous watch stopped ({reason}); check the official Korail app. "
+                "No new booking will be attempted.",
+            ),
+        )
+
+
+def _reconcile_continuous(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
+    try:
+        remote = _remote_holds(provider)
+    except BlockedError:
+        _preserve_account_unknown(db, "provider-blocked", [])
+        return "blocked"
+    except TransientError:
+        raise
+    except Exception:
+        _preserve_account_unknown(db, "account-read-unknown", [])
+        return "ambiguous"
+
+    paid = [hold for hold in remote if hold.paid and _matches_trip(trip, hold.train)]
+    try:
+        _record_paid(db, paid)
+    except Exception:
+        _preserve_account_unknown(db, "paid-record-invalid", remote)
+        return "ambiguous"
+    unpaid = [hold for hold in remote if not hold.paid]
+    if not unpaid:
+        return None
+    if len(unpaid) != 1:
+        _preserve_account_unknown(db, "multiple-unpaid-records", remote)
+        return "ambiguous"
+    existing = unpaid[0]
+    if not _matches_trip(trip, existing.train):
+        _preserve_account_unknown(db, "other-unpaid-record", remote)
+        return "ambiguous"
+    if existing.kind == "waitlist":
+        _preserve_queue_unknown(db, _hold_data(existing), remote, "existing-waitlist-unverified")
+        return "ambiguous"
+    paid_existing = next((hold for hold in paid if _same_train(hold.train, existing.train)), None)
+    if paid_existing:
+        _confirm_paid_overlap(db, existing, paid_existing)
+    else:
+        _confirm(db, existing)
+    return "existing-hold"
+
+
+def _continuous_preflight(db: sqlite3.Connection, trip: Trip, provider, train: Train) -> str | None:
+    result = _reconcile_continuous(db, trip, provider)
+    if result:
+        return result
+    return "paid-excluded" if _paid_train(db, train) else None
+
+
+def _monitor_hold(
+    db: sqlite3.Connection,
+    trip: Trip,
+    provider,
+    notifier,
+    *,
+    wait: bool,
+) -> str:
+    local = _get(db, "hold")
+    try:
+        held = _hold_from_data(local)
+    except Exception:
+        _preserve_expiry_unknown(db, local, "invalid-local-hold")
+        _drain_queue_outbox(db, notifier)
+        return "ambiguous"
+    try:
+        deadline = datetime.fromisoformat(held.deadline) if held.deadline else None
+    except (TypeError, ValueError):
+        deadline = None
+
     while True:
+        if _past_cutoff(trip):
+            return "cutoff"
         _drain_queue_outbox(db, notifier)
         try:
             remote = _remote_holds(provider)
         except BlockedError:
+            _preserve_expiry_unknown(db, local, "provider-blocked")
+            _drain_queue_outbox(db, notifier)
+            return "blocked"
+        except TransientError as exc:
+            _reset_expiry_absence(db)
+            if not wait:
+                return "payment-incomplete"
+            time.sleep(max(1.0, exc.retry_after if exc.retry_after is not None else 30.0))
+            continue
+        except AmbiguousReservation:
+            _preserve_expiry_unknown(db, local, "account-ambiguous")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
+        except Exception:
+            _preserve_expiry_unknown(db, local, "read-unknown")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
+
+        paid = [item for item in remote if item.paid and _matches_trip(trip, item.train)]
+        try:
+            _record_paid(db, paid)
+        except Exception:
+            _preserve_expiry_unknown(db, local, "paid-record-invalid")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
+
+        paid_current = next((item for item in paid if _same_train(item.train, held.train)), None)
+        unpaid = [item for item in remote if not item.paid]
+        current = next(
+            (item for item in unpaid if item.reference == held.reference),
+            None,
+        )
+        other_unpaid = [item for item in unpaid if item is not current]
+        if other_unpaid:
+            _reset_expiry_absence(db)
+            _preserve_mismatch(db, other_unpaid[0])
+            _preserve_expiry_unknown(db, local, "conflicting-unpaid-record")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
+        if current:
+            _reset_expiry_absence(db)
+            if not _same_train(current.train, held.train) or current.kind == "waitlist":
+                _preserve_mismatch(db, current)
+                _preserve_expiry_unknown(db, local, "identity-mismatch")
+                _drain_queue_outbox(db, notifier)
+                return "ambiguous"
+            local = _hold_data(current)
+            held = current
+            deadline = datetime.fromisoformat(held.deadline) if held.deadline else None
+            with db:
+                _set(db, "hold", local)
+                overlap = _get(db, "paid_overlap")
+                marker = {"hold_reference": held.reference, "train": _train_data(held.train)}
+                if paid_current and overlap != marker:
+                    _set(db, "paid_overlap", marker)
+                    db.execute(
+                        "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+                        (
+                            f"Korail payment is confirmed for {held.train.departure} → "
+                            f"{held.train.arrival}, {held.train.date} {held.train.dep_time}; "
+                            "waiting for the unpaid reservation record to clear before continuing.",
+                        ),
+                    )
+            if paid_current:
+                _drain_queue_outbox(db, notifier)
+            if not wait:
+                return "payment-pending"
+            time.sleep(30.0)
+            continue
+
+        if paid_current:
+            try:
+                _record_paid(db, [paid_current], continuing=True, clear_hold=True)
+            except Exception:
+                _preserve_expiry_unknown(db, local, "paid-record-invalid")
+                _drain_queue_outbox(db, notifier)
+                return "ambiguous"
+            _drain_queue_outbox(db, notifier)
+            return "paid"
+
+        now = _now()
+        if deadline is None or now < deadline + timedelta(seconds=60):
+            _reset_expiry_absence(db)
+            if not wait:
+                return "payment-pending" if deadline else "deadline-unknown"
+            time.sleep(30.0)
+            continue
+
+        absence = _get(db, "expiry_absence")
+        if not isinstance(absence, dict) or absence.get("reference") != held.reference:
+            with db:
+                _set(
+                    db,
+                    "expiry_absence",
+                    {"reference": held.reference, "first_absent_at": now.isoformat()},
+                )
+            if not wait:
+                return "expiry-verifying"
+            time.sleep(30.0)
+            continue
+        try:
+            first = datetime.fromisoformat(absence["first_absent_at"])
+        except (KeyError, TypeError, ValueError):
+            _reset_expiry_absence(db)
+            continue
+        remaining = 30.0 - (now - first).total_seconds()
+        if remaining > 0:
+            if not wait:
+                return "expiry-verifying"
+            time.sleep(remaining)
+            continue
+        try:
+            _archive_expired(db, local, absence["first_absent_at"])
+        except Exception:
+            _preserve_expiry_unknown(db, local, "archive-invalid")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
+        _drain_queue_outbox(db, notifier)
+        return "expired"
+
+
+def _monitor_queue(
+    db: sqlite3.Connection,
+    provider,
+    notifier,
+    *,
+    wait: bool,
+    trip: Trip,
+    continuous: bool = False,
+) -> str:
+    queued = _get(db, "queue")
+    while True:
+        if continuous and _past_cutoff(trip):
+            return "cutoff"
+        _drain_queue_outbox(db, notifier)
+        try:
+            remote = _remote_holds(provider)
+        except BlockedError:
+            if continuous:
+                _preserve_queue_unknown(db, queued, [], "provider-blocked")
+                _drain_queue_outbox(db, notifier)
             return "blocked"
         except TransientError as exc:
             if not wait:
@@ -308,19 +688,64 @@ def _monitor_queue(db: sqlite3.Connection, provider, notifier, *, wait: bool) ->
             _drain_queue_outbox(db, notifier)
             return "ambiguous"
 
-        current = next((hold for hold in remote if hold.reference == queued["reference"]), None)
+        original = _hold_from_data(queued)
+        paid = [hold for hold in remote if hold.paid and _matches_trip(trip, hold.train)]
+        try:
+            _record_paid(db, paid)
+        except Exception:
+            _preserve_queue_unknown(db, queued, remote, "paid-record-invalid")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
+        unpaid = [hold for hold in remote if not hold.paid]
+        paid_current = next((hold for hold in paid if _same_train(hold.train, original.train)), None)
+        current = next((hold for hold in unpaid if hold.reference == queued["reference"]), None)
+        other_unpaid = [hold for hold in unpaid if hold is not current]
+        if other_unpaid:
+            _preserve_queue_unknown(db, queued, remote, "conflicting-unpaid-record")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
         if current is None:
+            if paid_current:
+                try:
+                    _record_paid(
+                        db,
+                        [paid_current],
+                        continuing=continuous,
+                        clear_queue=True,
+                    )
+                    if not continuous:
+                        with db:
+                            db.execute(
+                                "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+                                (_message(paid_current),),
+                            )
+                except Exception:
+                    _preserve_queue_unknown(db, queued, remote, "paid-record-invalid")
+                    _drain_queue_outbox(db, notifier)
+                    return "ambiguous"
+                _drain_queue_outbox(db, notifier)
+                return "paid"
             _preserve_queue_unknown(db, queued, remote, "missing")
             _drain_queue_outbox(db, notifier)
             return "queue-missing"
-        original = _hold_from_data(queued)
         if not _same_train(current.train, original.train):
             _preserve_queue_unknown(db, queued, remote, "identity-mismatch")
             _drain_queue_outbox(db, notifier)
             return "ambiguous"
         if current.kind != "waitlist":
-            _confirm(db, current)
-            _drain_outbox(db, notifier, wait=wait)
+            if paid_current:
+                try:
+                    _confirm_paid_overlap(db, current, paid_current, continuous=continuous)
+                except Exception:
+                    _preserve_queue_unknown(db, queued, remote, "paid-record-invalid")
+                    _drain_queue_outbox(db, notifier)
+                    return "ambiguous"
+            else:
+                _confirm(db, current)
+            if continuous:
+                _drain_queue_outbox(db, notifier)
+            else:
+                _drain_outbox(db, notifier, wait=wait)
             return "allocated"
         with db:
             _set(db, "queue", _hold_data(current))
@@ -329,7 +754,13 @@ def _monitor_queue(db: sqlite3.Connection, provider, notifier, *, wait: bool) ->
         time.sleep(30.0)
 
 
-def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
+def _reconcile(
+    db: sqlite3.Connection,
+    trip: Trip,
+    provider,
+    *,
+    continuous: bool = False,
+) -> str | None:
     intent = _get(db, "intent")
     try:
         remote = _remote_holds(provider)
@@ -350,7 +781,18 @@ def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
             requested = intent.get("kind", intent.get("seat_class"))
             expected = "seated" if requested in ("general", "special") else requested
             if requested == "waitlist" and exact.kind != "waitlist":
-                _confirm(db, exact)
+                paid_exact = next(
+                    (
+                        hold
+                        for hold in remote
+                        if hold.paid and _same_train(hold.train, exact.train)
+                    ),
+                    None,
+                )
+                if not exact.paid and paid_exact:
+                    _confirm_paid_overlap(db, exact, paid_exact, continuous=continuous)
+                else:
+                    _confirm(db, exact)
                 return "allocated"
             if requested == "waitlist" and exact.kind == "waitlist":
                 _preserve_queue_unknown(
@@ -361,7 +803,18 @@ def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
                 )
                 return "ambiguous"
             if exact.kind == expected or (requested == "standing" and exact.kind == "seated"):
-                _confirm(db, exact)
+                paid_exact = next(
+                    (
+                        hold
+                        for hold in remote
+                        if hold.paid and _same_train(hold.train, exact.train)
+                    ),
+                    None,
+                )
+                if continuous and not exact.paid and paid_exact:
+                    _confirm_paid_overlap(db, exact, paid_exact)
+                else:
+                    _confirm(db, exact)
                 return "existing-ticket" if exact.paid else "existing-hold"
             _preserve_mismatch(db, exact)
             return "ambiguous"
@@ -383,7 +836,18 @@ def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
                 "existing-waitlist-unverified",
             )
             return "ambiguous"
-        _confirm(db, matching)
+        paid_matching = next(
+            (
+                hold
+                for hold in remote
+                if hold.paid and _same_train(hold.train, matching.train)
+            ),
+            None,
+        )
+        if not matching.paid and paid_matching:
+            _confirm_paid_overlap(db, matching, paid_matching, continuous=continuous)
+        else:
+            _confirm(db, matching)
         return "existing-ticket" if matching.paid else "existing-hold"
     return None
 
@@ -394,10 +858,38 @@ def _attempt(
     provider,
     train: Train,
     kinds: tuple[tuple[str, bool], ...],
+    *,
+    continuous: bool = False,
+    wait: bool = False,
 ) -> str | None:
     for kind, available in kinds:
         if not available:
             continue
+        if continuous:
+            while True:
+                if _past_cutoff(trip):
+                    return "cutoff"
+                if not trip.matches(train):
+                    return None
+                try:
+                    preflight = _continuous_preflight(db, trip, provider, train)
+                    break
+                except TransientError as exc:
+                    if not wait:
+                        return "incomplete"
+                    delay = max(1.0, exc.retry_after if exc.retry_after is not None else 30.0)
+                    remaining = _until_cutoff(trip)
+                    if not remaining:
+                        return "cutoff"
+                    time.sleep(min(delay, remaining))
+            if _past_cutoff(trip):
+                return "cutoff"
+            if not trip.matches(train):
+                return None
+            if preflight == "paid-excluded":
+                return None
+            if preflight:
+                return preflight
         intent = {"train": _train_data(train), "kind": kind, "adults": trip.adults, "created_at": _now().isoformat()}
         with db:
             _set(db, "intent", intent)
@@ -408,10 +900,10 @@ def _attempt(
                 db.execute("DELETE FROM state WHERE key = 'intent'")
             continue
         except BlockedError:
-            result = _reconcile(db, trip, provider)
+            result = _reconcile(db, trip, provider, continuous=continuous)
             return result or "blocked"
         except (AmbiguousReservation, TransientError, Exception):
-            result = _reconcile(db, trip, provider)
+            result = _reconcile(db, trip, provider, continuous=continuous)
             return result or "ambiguous"
         expected = "seated" if kind in ("general", "special") else kind
         accepted_kind = isinstance(hold, Hold) and (
@@ -429,6 +921,148 @@ def _attempt(
     return None
 
 
+def _search(
+    db: sqlite3.Connection,
+    trip: Trip,
+    provider,
+    notifier,
+    *,
+    armed: bool,
+    once: bool,
+    max_cycles: int | None,
+    continuous: bool,
+) -> str:
+    if _past_cutoff(trip):
+        return "cutoff"
+    try:
+        supported = _supported_modes(provider)
+    except TypeError:
+        return "error"
+
+    targets = _targets(trip)
+    start = int(_get(db, "cursor") or 0) % len(targets)
+    cycles = 1 if once or not armed else max_cycles
+    available = False
+    cycle = 0
+    incomplete = False
+    while cycles is None or cycle < cycles:
+        attempted: set[str] = set()
+        waitlist_candidates: list[Train] = []
+        waitlist_keys: set[str] = set()
+        pass_incomplete = False
+        pages = deque(
+            (*targets[(start + offset) % len(targets)], (start + offset) % len(targets))
+            for offset in range(len(targets))
+        )
+        while pages:
+            if _past_cutoff(trip):
+                return "cutoff"
+            if continuous:
+                _drain_queue_outbox(db, notifier)
+            departure, arrival, after, limit, position = pages.popleft()
+            with db:
+                _set(db, "cursor", (position + 1) % len(targets))
+            try:
+                trains = provider.search(trip, departure, arrival, after)
+            except TransientError as exc:
+                incomplete = True
+                pass_incomplete = True
+                time.sleep(max(0.0, exc.retry_after if exc.retry_after is not None else 5.0))
+                continue
+            except BlockedError:
+                return "blocked"
+            except Exception:
+                return "error"
+            if not isinstance(trains, list) or any(not isinstance(train, Train) for train in trains):
+                return "error"
+            for train in trains:
+                if not trip.matches(train):
+                    continue
+                immediate = (
+                    ("general", train.general and "general" in supported),
+                    ("special", train.special and "special" in supported),
+                    ("standing", train.standing and trip.allow_standing and "standing" in supported),
+                    ("mixed", train.mixed and trip.allow_mixed and "mixed" in supported),
+                )
+                can_waitlist = train.waitlist and trip.allow_waitlist and "waitlist" in supported
+                if not any(enabled for _, enabled in immediate) and not can_waitlist:
+                    continue
+                available = True
+                if can_waitlist and train.key not in waitlist_keys:
+                    waitlist_keys.add(train.key)
+                    waitlist_candidates.append(train)
+                if armed and train.key not in attempted:
+                    attempted.add(train.key)
+                    result = _attempt(
+                        db,
+                        trip,
+                        provider,
+                        train,
+                        immediate,
+                        continuous=continuous,
+                        wait=armed and not once,
+                    )
+                    if result:
+                        if result == "waitlisted":
+                            _drain_queue_outbox(db, notifier)
+                            return _monitor_queue(
+                                db,
+                                provider,
+                                notifier,
+                                wait=armed and not once,
+                                continuous=continuous,
+                                trip=trip,
+                            )
+                        if continuous:
+                            _drain_queue_outbox(db, notifier)
+                        else:
+                            _drain_outbox(db, notifier, wait=armed and not once)
+                        return result
+            if trains:
+                next_after = max(train.dep_time for train in trains) + ":01"
+                if next_after <= after:
+                    incomplete = True
+                    pass_incomplete = True
+                elif next_after < limit:
+                    pages.append((departure, arrival, next_after, limit, position))
+        if armed and waitlist_candidates and not pass_incomplete:
+            for candidate in waitlist_candidates:
+                if not trip.matches(candidate):
+                    continue
+                result = _attempt(
+                    db,
+                    trip,
+                    provider,
+                    candidate,
+                    (("waitlist", True),),
+                    continuous=continuous,
+                    wait=armed and not once,
+                )
+                if result:
+                    if result == "waitlisted":
+                        _drain_queue_outbox(db, notifier)
+                        return _monitor_queue(
+                            db,
+                            provider,
+                            notifier,
+                            wait=armed and not once,
+                            continuous=continuous,
+                            trip=trip,
+                        )
+                    if continuous:
+                        _drain_queue_outbox(db, notifier)
+                    else:
+                        _drain_outbox(db, notifier, wait=armed and not once)
+                    return result
+        cycle += 1
+        start = (start + 1) % len(targets)
+        with db:
+            _set(db, "cursor", start)
+    if incomplete:
+        return "incomplete"
+    return "available" if available else "not-found"
+
+
 def run(
     trip: Trip,
     provider,
@@ -438,10 +1072,13 @@ def run(
     armed: bool = False,
     once: bool = False,
     max_cycles: int | None = None,
+    continuous: bool = False,
 ) -> str:
     """Reconcile, scan fairly, and at most create one durable unpaid hold."""
     if not isinstance(trip, Trip):
         raise TypeError("trip must be a Trip")
+    if continuous and not armed:
+        raise ValueError("continuous mode requires armed=True")
     if armed and notifier is None:
         return "notifier-required"
     if max_cycles is not None and (type(max_cycles) is not int or max_cycles < 1):
@@ -452,121 +1089,130 @@ def run(
         if not acquired:
             return "locked"
         with closing(_connect(state_dir)) as db:
-            wait_for_notification = armed and not once
-            local = _get(db, "hold")
-            queue = _get(db, "queue")
-            queue_active = bool(queue or (local and local.get("kind", "seated") == "waitlist"))
-            if queue_active:
-                _drain_queue_outbox(db, notifier)
-            else:
-                _drain_outbox(db, notifier, wait=wait_for_notification)
-            if local:
-                if local.get("kind", "seated") == "waitlist":
-                    _confirm_queue(db, _hold_from_data(local))
-                    return _monitor_queue(db, provider, notifier, wait=wait_for_notification)
-                return "existing-ticket" if local.get("paid") else "existing-hold"
-            if _get(db, "queue_unknown"):
-                return "ambiguous"
-            if queue:
-                return _monitor_queue(db, provider, notifier, wait=wait_for_notification)
-            if _get(db, "reconciliation_unknown") or (_get(db, "ambiguous_hold") and not _get(db, "intent")):
-                return "ambiguous"
-            result = _reconcile(db, trip, provider)
-            if result:
-                _drain_outbox(db, notifier, wait=wait_for_notification)
-                return result
-            if _past_cutoff(trip):
-                return "cutoff"
+            while True:
+                local = _get(db, "hold")
+                queue = _get(db, "queue")
+                queue_active = bool(queue or (local and local.get("kind", "seated") == "waitlist"))
+                if continuous or queue_active:
+                    _drain_queue_outbox(db, notifier)
+                else:
+                    _drain_outbox(db, notifier, wait=armed and not once)
 
-            try:
-                supported = _supported_modes(provider)
-            except TypeError:
-                return "error"
-
-            targets = _targets(trip)
-            start = int(_get(db, "cursor") or 0) % len(targets)
-            cycles = 1 if once or not armed else max_cycles
-            available = False
-            cycle = 0
-            incomplete = False
-            while cycles is None or cycle < cycles:
-                attempted: set[str] = set()
-                waitlist_candidates: list[Train] = []
-                waitlist_keys: set[str] = set()
-                pass_incomplete = False
-                pages = deque(
-                    (*targets[(start + offset) % len(targets)], (start + offset) % len(targets))
-                    for offset in range(len(targets))
-                )
-                while pages:
-                    if _past_cutoff(trip):
-                        return "cutoff"
-                    departure, arrival, after, limit, position = pages.popleft()
-                    with db:
-                        _set(db, "cursor", (position + 1) % len(targets))
-                    try:
-                        trains = provider.search(trip, departure, arrival, after)
-                    except TransientError as exc:
-                        incomplete = True
-                        pass_incomplete = True
-                        time.sleep(max(0.0, exc.retry_after if exc.retry_after is not None else 5.0))
-                        continue
-                    except BlockedError:
-                        return "blocked"
-                    except Exception:
-                        return "error"
-                    if not isinstance(trains, list) or any(not isinstance(train, Train) for train in trains):
-                        return "error"
-                    for train in trains:
-                        if not trip.matches(train):
-                            continue
-                        immediate = (
-                            ("general", train.general and "general" in supported),
-                            ("special", train.special and "special" in supported),
-                            ("standing", train.standing and trip.allow_standing and "standing" in supported),
-                            ("mixed", train.mixed and trip.allow_mixed and "mixed" in supported),
+                if continuous:
+                    durable_unknown = (
+                        _get(db, "expiry_unknown")
+                        or _get(db, "reconciliation_unknown")
+                        or _get(db, "ambiguous_hold")
+                        or _get(db, "queue_unknown")
+                    )
+                    if durable_unknown:
+                        return "ambiguous"
+                    if local and _get(db, "intent"):
+                        _preserve_account_unknown(db, "intent-with-active-hold", [])
+                        _drain_queue_outbox(db, notifier)
+                        return "ambiguous"
+                if local:
+                    if local.get("kind", "seated") == "waitlist":
+                        _confirm_queue(db, _hold_from_data(local))
+                        result = _monitor_queue(
+                            db,
+                            provider,
+                            notifier,
+                            wait=armed and not once,
+                            continuous=continuous,
+                            trip=trip,
                         )
-                        can_waitlist = train.waitlist and trip.allow_waitlist and "waitlist" in supported
-                        if not any(available for _, available in immediate) and not can_waitlist:
-                            continue
-                        available = True
-                        if can_waitlist and train.key not in waitlist_keys:
-                            waitlist_keys.add(train.key)
-                            waitlist_candidates.append(train)
-                        if armed and train.key not in attempted:
-                            attempted.add(train.key)
-                            result = _attempt(db, trip, provider, train, immediate)
-                            if result:
-                                if result == "waitlisted":
-                                    _drain_queue_outbox(db, notifier)
-                                    return _monitor_queue(db, provider, notifier, wait=wait_for_notification)
-                                _drain_outbox(db, notifier, wait=wait_for_notification)
-                                return result
-                    if trains:
-                        next_after = max(train.dep_time for train in trains) + ":01"
-                        if next_after <= after:
-                            incomplete = True
-                            pass_incomplete = True
-                        elif next_after < limit:
-                            pages.append((departure, arrival, next_after, limit, position))
-                if armed and waitlist_candidates and not pass_incomplete:
-                    for candidate in waitlist_candidates:
-                        if not trip.matches(candidate):
-                            continue
-                        result = _attempt(db, trip, provider, candidate, (("waitlist", True),))
-                        if result:
-                            if result == "waitlisted":
-                                _drain_queue_outbox(db, notifier)
-                                return _monitor_queue(db, provider, notifier, wait=wait_for_notification)
-                            _drain_outbox(db, notifier, wait=wait_for_notification)
-                            return result
-                cycle += 1
-                start = (start + 1) % len(targets)
-                with db:
-                    _set(db, "cursor", start)
-            if incomplete:
-                return "incomplete"
-            return "available" if available else "not-found"
+                    elif not continuous:
+                        return "existing-ticket" if local.get("paid") else "existing-hold"
+                    elif local.get("paid"):
+                        try:
+                            _record_paid(db, [_hold_from_data(local)], continuing=True, clear_hold=True)
+                        except Exception:
+                            _preserve_expiry_unknown(db, local, "paid-record-invalid")
+                            return "ambiguous"
+                        _drain_queue_outbox(db, notifier)
+                        result = "paid"
+                    else:
+                        result = _monitor_hold(
+                            db,
+                            trip,
+                            provider,
+                            notifier,
+                            wait=armed and not once,
+                        )
+                    if continuous and not once and result in {"allocated", "expired", "paid"}:
+                        continue
+                    return result
+
+                if _get(db, "queue_unknown"):
+                    return "ambiguous"
+                if queue:
+                    result = _monitor_queue(
+                        db,
+                        provider,
+                        notifier,
+                        wait=armed and not once,
+                        continuous=continuous,
+                        trip=trip,
+                    )
+                    if continuous and not once and result in {"allocated", "paid"}:
+                        continue
+                    return result
+                if _get(db, "reconciliation_unknown") or (
+                    _get(db, "ambiguous_hold") and not _get(db, "intent")
+                ):
+                    return "ambiguous"
+
+                try:
+                    if continuous and not _get(db, "intent"):
+                        result = _reconcile_continuous(db, trip, provider)
+                    else:
+                        result = _reconcile(db, trip, provider, continuous=continuous)
+                except TransientError as exc:
+                    if once:
+                        return "incomplete"
+                    time.sleep(max(1.0, exc.retry_after if exc.retry_after is not None else 30.0))
+                    continue
+                if result:
+                    if continuous:
+                        if result in {"ambiguous", "blocked"} and not _get(db, "reconciliation_unknown"):
+                            _preserve_account_unknown(db, f"reconciliation-{result}", [])
+                        _drain_queue_outbox(db, notifier)
+                    else:
+                        _drain_outbox(db, notifier, wait=armed and not once)
+                    if continuous and not once and result in {
+                        "allocated",
+                        "existing-hold",
+                        "existing-ticket",
+                    }:
+                        continue
+                    return result
+
+                result = _search(
+                    db,
+                    trip,
+                    provider,
+                    notifier,
+                    armed=armed,
+                    once=once,
+                    max_cycles=max_cycles,
+                    continuous=continuous,
+                )
+                if (
+                    continuous
+                    and result in {"ambiguous", "blocked", "error"}
+                    and not _get(db, "reconciliation_unknown")
+                ):
+                    _preserve_account_unknown(db, f"search-{result}", [])
+                    _drain_queue_outbox(db, notifier)
+                if continuous and not once and result in {
+                    "allocated",
+                    "existing-hold",
+                    "paid",
+                    "reserved",
+                }:
+                    continue
+                return result
 
 
 def status(state_dir: Path) -> dict:
@@ -582,18 +1228,24 @@ def status(state_dir: Path) -> dict:
             "queue_unknown": None,
             "ambiguous_hold": None,
             "reconciliation_unknown": None,
+            "expiry_absence": None,
+            "expiry_unknown": None,
+            "expired_holds": [],
+            "paid_tickets": [],
             "notifications_pending": 0,
         }
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
         intent, hold, queue = _get(db, "intent"), _get(db, "hold"), _get(db, "queue")
         mismatch, queue_unknown = _get(db, "ambiguous_hold"), _get(db, "queue_unknown")
         reconciliation_unknown = _get(db, "reconciliation_unknown")
+        expiry_absence, expiry_unknown = _get(db, "expiry_absence"), _get(db, "expiry_unknown")
+        expired_holds, paid_tickets = _get(db, "expired_holds") or [], _get(db, "paid_tickets") or []
         pending = db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
         state = (
-            "held"
+            "ambiguous"
+            if intent or mismatch or reconciliation_unknown or queue_unknown or expiry_unknown
+            else "held"
             if hold
-            else "ambiguous"
-            if intent or mismatch or reconciliation_unknown or queue_unknown
             else "queued"
             if queue
             else "idle"
@@ -606,6 +1258,10 @@ def status(state_dir: Path) -> dict:
             "queue_unknown": queue_unknown,
             "ambiguous_hold": mismatch,
             "reconciliation_unknown": reconciliation_unknown,
+            "expiry_absence": expiry_absence,
+            "expiry_unknown": expiry_unknown,
+            "expired_holds": expired_holds,
+            "paid_tickets": paid_tickets,
             "notifications_pending": pending,
         }
 

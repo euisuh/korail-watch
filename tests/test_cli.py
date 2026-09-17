@@ -146,6 +146,21 @@ class CliTests(unittest.TestCase):
                 legacy = plistlib.load(handle)["ProgramArguments"]
             self.assertNotIn("--continuous", legacy)
 
+    def test_status_redacts_paid_references_recursively(self):
+        snapshot = {
+            "hold": {"reference": "unpaid-pnr", "paid": False},
+            "paid_tickets": [{"reference": "sale-ref-return-password", "paid": True}],
+            "evidence": {"remote": [{"reference": "nested-paid-secret", "paid": True}]},
+        }
+        output = StringIO()
+        with patch("korail_watch.engine.status", return_value=snapshot), redirect_stdout(output):
+            self.assertEqual(0, cli.main(["status"]))
+        displayed = output.getvalue()
+        self.assertIn("unpaid-pnr", displayed)
+        self.assertEqual(2, displayed.count("[redacted]"))
+        self.assertNotIn("sale-ref-return-password", displayed)
+        self.assertNotIn("nested-paid-secret", displayed)
+
     def test_demo_does_not_touch_default_state(self):
         with tempfile.TemporaryDirectory() as home, patch.object(Path, "home", return_value=Path(home)):
             output = StringIO()

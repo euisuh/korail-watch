@@ -138,6 +138,17 @@ def _state_dir(value: Path | None) -> Path:
     return value if value is not None else default_state_dir()
 
 
+def _status_for_display(value):
+    if isinstance(value, list):
+        return [_status_for_display(item) for item in value]
+    if isinstance(value, dict):
+        displayed = {key: _status_for_display(item) for key, item in value.items()}
+        if value.get("paid") is True and "reference" in value:
+            displayed["reference"] = "[redacted]"
+        return displayed
+    return value
+
+
 def _warn_unsupported(trip, provider) -> None:
     supported = getattr(provider, "supported_modes", frozenset())
     labels = {
@@ -161,7 +172,8 @@ def _execute(args: argparse.Namespace) -> str:
     if args.command == "status":
         from .engine import status
 
-        return json.dumps(status(_state_dir(args.state_dir)), ensure_ascii=False, indent=2, default=str)
+        snapshot = _status_for_display(status(_state_dir(args.state_dir)))
+        return json.dumps(snapshot, ensure_ascii=False, indent=2, default=str)
 
     if args.command == "demo":
         from .engine import demo
