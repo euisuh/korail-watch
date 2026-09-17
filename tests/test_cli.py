@@ -26,8 +26,17 @@ class CliTests(unittest.TestCase):
             "getpass.getpass", side_effect=lambda _: next(values)
         ), patch.dict(os.environ, {"KORAIL_ID": "environment-id"}, clear=False):
             cli.configure()
-            cli.load_credentials()
+            cli.load_credentials("KORAIL_ID")
             self.assertEqual("environment-id", os.environ["KORAIL_ID"])
+
+    def test_read_only_credentials_do_not_require_telegram(self):
+        values = iter(("member", "password", "", ""))
+        with tempfile.TemporaryDirectory() as home, patch.object(Path, "home", return_value=Path(home)), patch(
+            "getpass.getpass", side_effect=lambda _: next(values)
+        ), patch.dict(os.environ, {}, clear=True):
+            cli.configure()
+            cli.load_credentials("KORAIL_ID", "KORAIL_PASSWORD")
+            self.assertEqual("member", os.environ["KORAIL_ID"])
 
     def test_watch_requires_explicit_arm(self):
         with self.assertRaises(SystemExit) as raised:

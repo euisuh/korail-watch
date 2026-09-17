@@ -28,7 +28,8 @@ korail-watch configure
 `configure` prompts without echo and writes credentials with mode `0600` to
 `~/Library/Application Support/korail-watch/credentials.toml`. Credentials are
 never accepted as command-line arguments. Do not copy that file into the
-repository or share it in logs, issues, or screenshots.
+repository or share it in logs, issues, or screenshots. Telegram values may be
+left blank for `check`, but both are required for `notify-test` and armed use.
 
 The committed example is intentionally nonsecret:
 

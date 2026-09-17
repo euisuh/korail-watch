@@ -29,8 +29,12 @@ def configure() -> str:
         "TELEGRAM_BOT_TOKEN": getpass.getpass("Telegram bot token: "),
         "TELEGRAM_CHAT_ID": getpass.getpass("Telegram chat ID: "),
     }
-    if any(not value or "\n" in value or "\0" in value for value in values.values()):
-        raise ValueError("all credential values are required and must be one line")
+    if not values["KORAIL_ID"] or not values["KORAIL_PASSWORD"]:
+        raise ValueError("Korail ID and password are required")
+    if bool(values["TELEGRAM_BOT_TOKEN"]) != bool(values["TELEGRAM_CHAT_ID"]):
+        raise ValueError("Telegram token and chat ID must both be set or both be blank")
+    if any("\n" in value or "\0" in value for value in values.values()):
+        raise ValueError("credential values must be one line")
 
     directory = app_dir()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -50,17 +54,21 @@ def configure() -> str:
     return "Credentials saved to the private macOS application-support directory."
 
 
-def load_credentials() -> None:
+def load_credentials(*required: str) -> None:
     try:
         with credentials_path().open("rb") as handle:
             values = tomllib.load(handle)["credentials"]
-    except (FileNotFoundError, KeyError, tomllib.TOMLDecodeError) as exc:
-        raise ValueError("credentials are missing or invalid; run `korail-watch configure`") from exc
-    for key in ("KORAIL_ID", "KORAIL_PASSWORD", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+    except FileNotFoundError:
+        values = {}
+    except (KeyError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError("credentials are invalid; run `korail-watch configure`") from exc
+    for key in required:
+        if os.environ.get(key):
+            continue
         value = values.get(key)
         if not isinstance(value, str) or not value:
-            raise ValueError("credentials are incomplete; run `korail-watch configure`")
-        os.environ.setdefault(key, value)
+            raise ValueError("required credentials are missing; run `korail-watch configure`")
+        os.environ[key] = value
 
 
 def load_trip(path: Path):
@@ -134,10 +142,10 @@ def _execute(args: argparse.Namespace) -> str:
 
         return demo(_state_dir(args.state_dir))
 
-    load_credentials()
     if args.command == "notify-test":
         from .notifier import TelegramNotifier
 
+        load_credentials("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
         TelegramNotifier().send("Korail Watch notification test.")
         return "Notification sent."
 
@@ -145,6 +153,10 @@ def _execute(args: argparse.Namespace) -> str:
     from .korail import KorailProvider
 
     trip = load_trip(args.config)
+    required = ["KORAIL_ID", "KORAIL_PASSWORD"]
+    if args.command == "watch":
+        required += ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+    load_credentials(*required)
     provider = KorailProvider(interval=provider_interval(args.config))
     provider.login()
     if args.command == "check":
@@ -169,4 +181,3 @@ def main(argv: list[str] | None = None) -> int:
     if result:
         print(result)
     return 0
-
