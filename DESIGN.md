@@ -51,6 +51,11 @@ mode may archive a missed-deadline hold and resume only after deadline plus grac
 and two complete, separated account snapshots prove its PNR absent. It preserves
 paid tickets as exclusions and permits no more than one active unpaid hold or
 waitlist while seeking alternatives through the trip cutoff.
+Paid exclusions retain every validated segment on the requested date. A new
+candidate is excluded by exact journey identity or by overlapping a paid segment
+on the same validated canonical train service; legacy keys remain exact-match
+only. Segment overlap is never evidence to mark a hold paid or clear durable
+state, and it does not add transfer-booking support.
 The one-unpaid policy relies on refreshed account snapshots rather than a
 provider-wide lock against simultaneous manual reservations. Unexpected extra
 unpaid records, authentication blocks, or unknown state stop for operator review.
@@ -87,6 +92,9 @@ issues, artifacts, or Git history.
   the exact provider availability markers and authoritative one-passenger
   standing readback. Mixed remains unsupported and warns with an app handoff.
 - `reservations() -> list[Hold]` and `tickets() -> list[Hold]` for reconciliation.
+- Paid records are matched by full sale reference plus full journey identity, so
+  distinct validated segments may share a reference without overwriting. Exact
+  duplicate, malformed, conflicting, truncated, or incomplete records fail closed.
 - Separate per-instance requests Session with timeout, throttling and HTTP error
   translation. Internal SDK prints suppressed. Preserve security-block signals.
 - An exact P058 session-expiry response may renew login and retry a top-level
@@ -117,6 +125,11 @@ issues, artifacts, or Git history.
 - Engine handles lock, SQLite intent/hold/outbox, reconciliation, fair cursors,
   sold-out alternatives, stop at trip cutoff. Injection of sleep/clock accepted
   if useful for deterministic tests. Provider owns all network throttling.
+- Continuous account reads retain validated paid segments for the trip date.
+  Same-service interval overlap prevents only a new duplicate booking; canonical
+  service identity must be structurally valid and consistent with the train.
+  Touching half-open intervals do not overlap; an invalid or overnight interval
+  on the same proven service excludes conservatively.
 - Dry-run never calls reserve; --once performs bounded read-only coverage.
 - Session renewal stays inside the provider's top-level read boundary; the
   engine adds no restart loop and never clears durable ambiguity state.

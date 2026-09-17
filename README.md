@@ -104,6 +104,14 @@ snapshots, at least 30 seconds apart, prove the known PNR absent with no
 conflicting unpaid record. Missing deadlines, read errors, identity conflicts,
 or ambiguous state stop new writes rather than guessing.
 
+A paid journey may contain distinct validated segments that share one provider
+sale reference. Continuous mode retains every paid segment on the requested date
+and will not create a booking that exactly matches one or overlaps it on the same
+validated train service. This is duplicate protection only: it does not book
+transfers, mark another hold paid, clear durable state, pay, or cancel anything.
+Malformed, conflicting, duplicate, truncated, or incomplete paid records still
+stop safely for review.
+
 The one-unpaid limit is enforced from refreshed account snapshots, not a
 server-wide lock against simultaneous actions in the official app. Avoid creating
 other reservations manually while the watcher is armed; paying the current hold
