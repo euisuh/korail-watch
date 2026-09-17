@@ -12,7 +12,9 @@ case "${1:-}" in
     config="$config_dir/$(basename "$config")"
     watcher=$(command -v korail-watch)
     caffeinate=$(command -v caffeinate)
-    result=$("$watcher" check --config "$config")
+    check_output=$("$watcher" check --config "$config")
+    printf '%s\n' "$check_output"
+    result=$(printf '%s\n' "$check_output" | tail -n 1)
     case "$result" in
       available|not-found) ;;
       *) echo "Read-only check did not complete safely: $result" >&2; exit 1 ;;

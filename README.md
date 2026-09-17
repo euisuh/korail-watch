@@ -47,8 +47,8 @@ interval = 5.0
 ```
 
 Do not substitute another station silently. In particular, 광명 and 수원 are
-not part of this trip. If the unofficial API cannot expose 수서 service, the
-watcher reports no supported result for that route.
+not part of this trip. If the unofficial API cannot expose 수서 service, those
+exact searches return no trains; the watcher never substitutes another station.
 
 ## Use
 
@@ -59,6 +59,11 @@ korail-watch demo
 korail-watch check --config trip.toml
 korail-watch notify-test
 ```
+
+`check` covers 42 route/hour targets at no less than five seconds between
+requests, plus login and reconciliation, so a complete run takes several
+minutes. Its final line is the termination outcome; `not-found` means the full
+configured window was checked, not that the command hung.
 
 No live reservation is attempted until `--arm` is present:
 

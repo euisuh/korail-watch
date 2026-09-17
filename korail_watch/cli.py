@@ -55,8 +55,11 @@ def configure() -> str:
 
 
 def load_credentials(*required: str) -> None:
+    path = credentials_path()
     try:
-        with credentials_path().open("rb") as handle:
+        if path.stat().st_mode & 0o077:
+            raise ValueError("credentials permissions are unsafe; run `chmod 600` on the credentials file")
+        with path.open("rb") as handle:
             values = tomllib.load(handle)["credentials"]
     except FileNotFoundError:
         values = {}
@@ -161,12 +164,14 @@ def _execute(args: argparse.Namespace) -> str:
     provider = KorailProvider(interval=provider_interval(args.config))
     provider.login()
     if args.command == "check":
+        print("Read-only check started; scanning the full configured window at the safe request rate.", flush=True)
         return run(trip, provider, None, _state_dir(args.state_dir), armed=False, once=True)
 
     from .notifier import TelegramNotifier
 
     notifier = TelegramNotifier()
     notifier.send("Korail Watch is armed and starting.")
+    print("Armed watch started; Ctrl-C stops it.", flush=True)
     return run(trip, provider, notifier, _state_dir(args.state_dir), armed=True)
 
 
