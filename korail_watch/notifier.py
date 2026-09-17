@@ -41,17 +41,27 @@ class TelegramNotifier:
             if not result.get("ok"):
                 raise BlockedError("Telegram rejected the notification")
         except urllib.error.HTTPError as exc:
-            retry = _retry_after(exc.headers.get("Retry-After"))
-            if exc.code == 429:
-                if retry is None:
-                    try:
-                        retry = float(json.loads(exc.read()).get("parameters", {}).get("retry_after"))
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        pass
-                raise TransientError(retry_after=retry) from None
-            if exc.code >= 500:
+            try:
+                retry = _retry_after((exc.headers or {}).get("Retry-After"))
+                if exc.code == 429:
+                    if retry is None:
+                        try:
+                            retry = float(json.loads(exc.read()).get("parameters", {}).get("retry_after"))
+                        except Exception:
+                            pass
+                    raise TransientError(retry_after=retry) from None
+                if exc.code >= 500:
+                    raise TransientError() from None
+                raise BlockedError("Telegram rejected the notification") from None
+            except (TransientError, BlockedError):
+                raise
+            except Exception:
                 raise TransientError() from None
-            raise BlockedError("Telegram rejected the notification") from None
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
         except (urllib.error.URLError, TimeoutError, socket.timeout):
             raise TransientError() from None
         except json.JSONDecodeError:

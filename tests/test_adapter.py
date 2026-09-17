@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import types
 import unittest
@@ -74,6 +75,8 @@ class RawReservation(RawTrain):
     buy_limit_date = "20260924"
     buy_limit_time = "143000"
     price = 23700
+    seat_no_count = 1
+    reservation_type_code = "3"
 
 
 class RawTicket(RawTrain):
@@ -159,6 +162,15 @@ class ProviderTests(unittest.TestCase):
                 with self.assertRaises(AmbiguousReservation):
                     provider(client).reserve(provider()._train(RawTrain()), "general", 1)
 
+    def test_reserve_rejects_unexpected_seat_count(self):
+        class TwoSeatReservation(RawReservation):
+            seat_no_count = 2
+
+        client = FakeClient()
+        client.reserve = lambda *args, **kwargs: TwoSeatReservation()
+        with self.assertRaises(AmbiguousReservation):
+            provider(client).reserve(provider()._train(RawTrain()), "general", 1)
+
     def test_reserve_definitive_sold_out_is_not_ambiguous(self):
         client = FakeClient()
         client.reserve = lambda *args, **kwargs: (_ for _ in ()).throw(_SoldOut())
@@ -172,6 +184,71 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual([True], [item.paid for item in tickets])
         self.assertEqual("ticket-1", tickets[0].reference)
         self.assertIsNone(tickets[0].deadline)
+
+    def test_reconciliation_never_labels_waitlist_or_unknown_status_as_a_hold(self):
+        for reservation_type in ("8", None):
+            raw = RawReservation()
+            raw.reservation_type_code = reservation_type
+            client = FakeClient()
+            client.reservations = lambda value=raw: [value]
+            with self.subTest(reservation_type=reservation_type):
+                with self.assertRaises(AmbiguousReservation):
+                    provider(client).reservations()
+
+    def test_pinned_sdk_discarded_status_is_retained_at_session_boundary(self):
+        import korail2
+
+        payload = {
+            "strResult": "SUCC",
+            "jrny_infos": {
+                "jrny_info": [
+                    {
+                        "train_infos": {
+                            "train_info": [
+                                {
+                                    "h_pnr_no": "reservation-1",
+                                    "h_rsv_tp_cd": "3",
+                                    "h_tot_seat_cnt": "1",
+                                    "h_run_dt": "20260924",
+                                    "h_ntisu_lmt_dt": "20260924",
+                                    "h_ntisu_lmt_tm": "143000",
+                                    "h_rsv_amt": "23700",
+                                    "h_trn_clsf_cd": "100",
+                                    "h_trn_no": "001",
+                                    "h_trn_gp_cd": "100",
+                                    "h_dpt_rs_stn_nm": "서울",
+                                    "h_dpt_tm": "120000",
+                                    "h_arv_rs_stn_nm": "대전",
+                                    "h_arv_tm": "130000",
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        }
+        response = requests.Response()
+        response.status_code = 200
+        response.url = "https://smart.letskorail.com/reservation"
+        response._content = json.dumps(payload).encode()
+        response.encoding = "utf-8"
+        adapter = KorailProvider()
+        client = korail2.Korail("member", "password", auto_login=False)
+        client._session = adapter._session
+        adapter._sdk, adapter._client = korail2, client
+
+        with patch.object(requests.Session, "request", return_value=response):
+            holds = adapter.reservations()
+
+        self.assertEqual("reservation-1", holds[0].reference)
+        self.assertFalse(hasattr(holds[0].train.raw, "reservation_type_code"))
+
+        payload["jrny_infos"]["jrny_info"][0]["train_infos"]["train_info"][0]["h_rsv_tp_cd"] = "8"
+        response._content = json.dumps(payload).encode()
+        korail._NEXT_REQUEST = 0.0
+        with patch.object(requests.Session, "request", return_value=response):
+            with self.assertRaises(AmbiguousReservation):
+                adapter.reservations()
 
     def test_session_paces_every_request_and_applies_timeout(self):
         clock = [100.0]
@@ -258,14 +335,16 @@ class TelegramTests(unittest.TestCase):
 
     def test_429_uses_retry_after_without_leaking_token(self):
         token = self.env["TELEGRAM_BOT_TOKEN"]
+        body = io.BytesIO(b'{"parameters":{"retry_after":17}}')
         error = urllib.error.HTTPError(
-            f"https://api.telegram.org/bot{token}/sendMessage", 429, token, {"Retry-After": "17"}, None
+            f"https://api.telegram.org/bot{token}/sendMessage", 429, token, {"Retry-After": "17"}, body
         )
         with patch.dict(os.environ, self.env, clear=True), patch("urllib.request.urlopen", side_effect=error):
             with self.assertRaises(TransientError) as raised:
                 TelegramNotifier().send("test")
         self.assertEqual(17.0, raised.exception.retry_after)
         self.assertNotIn(token, str(raised.exception))
+        self.assertTrue(body.closed)
 
 
 if __name__ == "__main__":

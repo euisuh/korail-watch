@@ -164,9 +164,9 @@ def _drain_outbox(db: sqlite3.Connection, notifier, *, wait: bool = False) -> No
             time.sleep(delay)
         try:
             notifier.send(row[1])
-        except Exception as exc:
+        except TransientError as exc:
             attempts = row[2] + 1
-            retry_after = exc.retry_after if isinstance(exc, TransientError) else None
+            retry_after = exc.retry_after
             delay = min(3600.0, max(1.0, retry_after if retry_after is not None else 5 * 2 ** min(attempts, 8)))
             with db:
                 db.execute(
@@ -225,6 +225,11 @@ def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
         remote = _remote_holds(provider)
     except BlockedError:
         return "blocked"
+    except AmbiguousReservation:
+        if not intent:
+            with db:
+                _set(db, "reconciliation_unknown", {"created_at": _now().isoformat()})
+        return "ambiguous"
     except Exception:
         return "ambiguous" if intent else "error"
 
@@ -302,7 +307,7 @@ def run(
             local = _get(db, "hold")
             if local:
                 return "existing-ticket" if local.get("paid") else "existing-hold"
-            if _get(db, "ambiguous_hold") and not _get(db, "intent"):
+            if _get(db, "reconciliation_unknown") or (_get(db, "ambiguous_hold") and not _get(db, "intent")):
                 return "ambiguous"
             result = _reconcile(db, trip, provider)
             if result:
@@ -369,16 +374,29 @@ def run(
 def status(state_dir: Path) -> dict:
     """Return a credential-free snapshot suitable for the CLI."""
     state_dir = Path(state_dir)
-    if not (state_dir / "state.sqlite3").exists():
-        return {"state": "new", "intent": None, "hold": None, "ambiguous_hold": None, "notifications_pending": 0}
-    with _lock(state_dir) as acquired:
-        if not acquired:
-            return {"state": "running"}
-        with closing(_connect(state_dir)) as db:
-            intent, hold, mismatch = _get(db, "intent"), _get(db, "hold"), _get(db, "ambiguous_hold")
-            pending = db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
-            state = "held" if hold else "ambiguous" if intent or mismatch else "idle"
-            return {"state": state, "intent": intent, "hold": hold, "ambiguous_hold": mismatch, "notifications_pending": pending}
+    path = state_dir / "state.sqlite3"
+    if not path.exists():
+        return {
+            "state": "new",
+            "intent": None,
+            "hold": None,
+            "ambiguous_hold": None,
+            "reconciliation_unknown": None,
+            "notifications_pending": 0,
+        }
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+        intent, hold, mismatch = _get(db, "intent"), _get(db, "hold"), _get(db, "ambiguous_hold")
+        reconciliation_unknown = _get(db, "reconciliation_unknown")
+        pending = db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+        state = "held" if hold else "ambiguous" if intent or mismatch or reconciliation_unknown else "idle"
+        return {
+            "state": state,
+            "intent": intent,
+            "hold": hold,
+            "ambiguous_hold": mismatch,
+            "reconciliation_unknown": reconciliation_unknown,
+            "notifications_pending": pending,
+        }
 
 
 def demo(state_dir: Path) -> str:

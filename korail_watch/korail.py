@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import io
+import json
 import os
 import random
 import threading
@@ -38,6 +39,7 @@ class _PacedSession(requests.Session):
         super().__init__()
         self.interval = max(5.0, float(interval))
         self.timeout = float(timeout)
+        self.reservation_status: dict[str, tuple[str | None, int | None] | None] = {}
 
     def request(self, method, url, **kwargs):
         global _NEXT_REQUEST
@@ -56,7 +58,22 @@ class _PacedSession(requests.Session):
                 with _PACE_LOCK:
                     _NEXT_REQUEST = max(_NEXT_REQUEST, time.monotonic() + retry)
         response.raise_for_status()
+        if url.rstrip("/").endswith(".reservation.ReservationView"):
+            self._capture_reservation_status(response)
         return response
+
+    def _capture_reservation_status(self, response) -> None:
+        snapshot: dict[str, tuple[str | None, int | None] | None] = {}
+        try:
+            journeys = response.json().get("jrny_infos", {}).get("jrny_info", [])
+            for journey in journeys:
+                for train in journey.get("train_infos", {}).get("train_info", []):
+                    reference = str(train["h_pnr_no"])
+                    value = (train.get("h_rsv_tp_cd"), _integer(train.get("h_tot_seat_cnt")))
+                    snapshot[reference] = value if reference not in snapshot or snapshot[reference] == value else None
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        self.reservation_status = snapshot
 
 
 class KorailProvider:
@@ -135,8 +152,10 @@ class KorailProvider:
             self._raise(exc, mutation=True)
         if reservation is None:
             raise AmbiguousReservation("Korail did not return the created reservation")
+        if getattr(reservation, "seat_no_count", None) != adults:
+            raise AmbiguousReservation("Korail returned an unexpected seat count")
         try:
-            return self._hold(reservation, paid=False)
+            return self._hold(reservation, paid=False, known_seated=True)
         except Exception:
             raise AmbiguousReservation("Korail reservation outcome is unknown") from None
 
@@ -179,12 +198,21 @@ class KorailProvider:
             raw=raw,
         )
 
-    def _hold(self, raw, *, paid: bool) -> Hold:
+    def _hold(self, raw, *, paid: bool, known_seated: bool = False) -> Hold:
         if paid:
             reference = raw.get_ticket_no()
             deadline = None
         else:
             reference = raw.rsv_id
+            status = self._session.reservation_status.get(str(reference))
+            if status is None:
+                status = (
+                    getattr(raw, "reservation_type_code", None),
+                    getattr(raw, "seat_no_count", None),
+                )
+            # korail2 drops h_rsv_tp_cd; the paced session retains only this status tuple.
+            if not known_seated and (str(status[0]).lstrip("0") != "3" or status[1] != 1):
+                raise AmbiguousReservation("Korail reservation seating status is unavailable")
             deadline = _deadline(raw.buy_limit_date, raw.buy_limit_time)
         if reference in (None, ""):
             raise ValueError("provider record has no reference")
@@ -197,6 +225,8 @@ class KorailProvider:
         )
 
     def _raise(self, exc: Exception, *, mutation: bool = False):
+        if isinstance(exc, (SoldOut, TransientError, BlockedError, AmbiguousReservation)):
+            raise exc
         sdk = self._sdk
         if sdk is not None and isinstance(exc, sdk.SoldOutError):
             raise SoldOut from None

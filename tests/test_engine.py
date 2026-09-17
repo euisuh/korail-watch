@@ -8,7 +8,16 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from korail_watch.domain import KST, AmbiguousReservation, Hold, SoldOut, Train, TransientError, Trip
+from korail_watch.domain import (
+    KST,
+    AmbiguousReservation,
+    BlockedError,
+    Hold,
+    SoldOut,
+    Train,
+    TransientError,
+    Trip,
+)
 from korail_watch.engine import _lock, demo, run, status
 
 
@@ -220,6 +229,20 @@ class EngineTests(unittest.TestCase):
         self.assertIsNotNone(snapshot["intent"])
         self.assertEqual(snapshot["ambiguous_hold"]["reference"], "WRONG")
 
+    def test_ambiguous_reconciliation_is_durable_without_local_intent(self):
+        class Uncertain(Provider):
+            def reservations(self):
+                raise AmbiguousReservation()
+
+        provider = Uncertain([train()])
+        self.assertEqual(run(trip(), provider, Notifier(), self.state, armed=True, once=True), "ambiguous")
+        self.assertEqual(status(self.state)["state"], "ambiguous")
+
+        safe_later = Provider([train()])
+        self.assertEqual(run(trip(), safe_later, Notifier(), self.state, armed=True, once=True), "ambiguous")
+        self.assertEqual(safe_later.calls, [])
+        self.assertEqual(safe_later.reserve_calls, [])
+
     def test_notification_failure_cannot_trigger_another_hold(self):
         provider = Provider([train()])
         notifier = Notifier(TransientError(retry_after=60))
@@ -237,6 +260,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(notifier.messages), 2)
         self.assertEqual(len(provider.reserve_calls), 1)
         self.assertEqual(status(self.state)["notifications_pending"], 0)
+
+    def test_blocked_notification_stops_watcher_with_hold_and_outbox_durable(self):
+        provider = Provider([train()])
+        notifier = Notifier(BlockedError("Telegram rejected notification"))
+        with self.assertRaises(BlockedError):
+            run(trip(), provider, notifier, self.state, armed=True)
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertEqual(len(provider.reserve_calls), 1)
+        snapshot = status(self.state)
+        self.assertEqual(snapshot["state"], "held")
+        self.assertEqual(snapshot["notifications_pending"], 1)
         self.assertEqual(run(trip(), provider, Notifier(), self.state, armed=True, once=True), "existing-hold")
         self.assertEqual(len(provider.reserve_calls), 1)
 
@@ -244,6 +278,14 @@ class EngineTests(unittest.TestCase):
         with _lock(self.state) as acquired:
             self.assertTrue(acquired)
             self.assertEqual(run(trip(), Provider(), None, self.state, once=True), "locked")
+
+    def test_status_reads_committed_hold_while_watch_lock_is_held(self):
+        self.assertEqual(run(trip(), Provider([train()]), Notifier(), self.state, armed=True, once=True), "reserved")
+        with _lock(self.state) as acquired:
+            self.assertTrue(acquired)
+            snapshot = status(self.state)
+        self.assertEqual(snapshot["state"], "held")
+        self.assertEqual(snapshot["hold"]["reference"], "R1")
 
     def test_past_cutoff_and_unknown_reconciliation_fail_closed(self):
         past = trip(date="2000-01-01")

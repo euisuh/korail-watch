@@ -94,6 +94,11 @@ Inspect durable local state at any time:
 korail-watch status
 ```
 
+`status` is read-only and remains available while a watcher holds the process
+lock. Reconciliation accepts only a confirmed seated reservation for exactly
+one passenger; waitlist or missing seating metadata is treated as ambiguous and
+stops new attempts.
+
 When a hold succeeds, open the official Korail app immediately and pay before
 the provider's actual deadline shown in the notification. If the deadline is
 unavailable, check the app immediately. The program never invents a payment
@@ -107,7 +112,10 @@ reservation response leaves an unresolved intent and stops new reservations.
 Run `korail-watch status`, then inspect reservations and tickets in the official
 Korail app before taking further action. Do not delete state merely to restart:
 an ambiguous request may already have created a hold. A notification failure is
-also not permission to reserve again.
+also not permission to reserve again. Transient Telegram failures retry with
+bounded backoff while booking remains frozen. A non-retryable Telegram error
+stops the process but preserves both the hold and pending notification for
+operator recovery.
 
 The watcher uses one authenticated session, at least five seconds between
 requests, bounded retry behavior, and no parallel accounts, proxies, queue
