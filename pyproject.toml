@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "korail-watch"
+version = "0.1.0"
+description = "A cautious local watcher for one Korail reservation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+dependencies = [
+  "korail2 @ git+https://github.com/dhfhfk/korail2.git@4b134266fff097ea0fd54e9f760cb128b6c8f878",
+]
+
+[project.scripts]
+korail-watch = "korail_watch.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["korail_watch*"]
+
