@@ -145,6 +145,23 @@ lock. A queue entry appears separately from a confirmed hold. While queued, the
 watcher monitors that same reservation and never starts another booking. Missing
 or uncertain queue state is treated as ambiguous and stops new attempts.
 
+Sanitized diagnostics are written to the selected state directory as
+`diagnostics.jsonl`, rotated at about 1 MiB with three backups. The directory is
+mode `0700` and log files are mode `0600`, including after rollover. Records use
+only bounded fields such as operation, stage, outcome, HTTP status, provider
+code, exception class, and a random attempt correlation value. They never include
+raw responses, exception messages, URLs, headers, credentials, passenger data,
+PNRs, paid sale/refund references, or Telegram secrets. Do not publish the files.
+
+Diagnostics initialize before provider login. Startup stops with a sanitized
+error if the private file cannot be created; later write or rotation failures
+emit at most a fixed warning and cannot undo a successful reservation. To inspect
+locally while troubleshooting:
+
+```sh
+tail -f "$HOME/Library/Application Support/korail-watch/state/diagnostics.jsonl"
+```
+
 In continuous mode, status also retains paid-ticket exclusions and the archive
 of expired holds with their verification evidence. These records prevent the
 same journey or an uncertain expiry from creating a duplicate. Do not edit or
@@ -174,6 +191,21 @@ Legacy state remains compatible: a stored hold without a `kind` is treated as a
 seated hold. Continuous mode does not use expiry to resolve an ambiguous write or
 unproven waitlist follow-up. Do not delete queue, hold, paid-exclusion, or archive
 state to force another attempt.
+
+Before attempting a deferred waitlist candidate, the watcher refreshes that exact
+train and uses the new provider object. A stale or no-longer-eligible candidate is
+skipped; newly immediate inventory follows the existing seat/standing path. A
+transient read-only refresh backs off without writing an intent. Once a mutation
+may have been dispatched, uncertainty or incomplete follow-up still stops safely.
+Diagnostics cannot reconstruct the cause of incidents that occurred before this
+logging existed.
+
+Safe automatic recovery at the mutation boundary is deliberately narrow: only an
+initial connection-establishment timeout can be classified as not dispatched,
+with redirects disabled and the transport's default retries set to zero. Generic
+connection, read, or HTTP errors after possible dispatch—and any incomplete
+waitlist follow-up—remain uncertain and stop for review. An unconfirmed outcome
+is not proof that Korail rejected the request.
 
 The watcher uses one authenticated session, at least five seconds between
 requests, bounded retry behavior, and no parallel accounts, proxies, queue

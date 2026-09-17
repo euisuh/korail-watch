@@ -14,7 +14,16 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from .domain import AmbiguousReservation, BlockedError, Hold, SoldOut, Train, TransientError
+from . import diagnostics
+from .domain import (
+    AmbiguousReservation,
+    BlockedError,
+    Hold,
+    ReservationNotSent,
+    SoldOut,
+    Train,
+    TransientError,
+)
 
 
 _PACE_LOCK = threading.Lock()
@@ -54,13 +63,35 @@ class _PacedSession(requests.Session):
         self.ticket_complete = False
         self.reservation_overrides: dict[str, str] = {}
         self.last_reservation_response: dict | None = None
+        self.reservation_active = False
+        self.last_operation = "provider"
+        self.last_stage = "request"
+
+    @contextlib.contextmanager
+    def reservation_attempt(self):
+        self.reservation_active = True
+        self.last_operation, self.last_stage = "reserve", "preflight"
+        try:
+            yield
+        finally:
+            self.reservation_active = False
+            self.reservation_overrides = {}
 
     def request(self, method, url, **kwargs):
         global _NEXT_REQUEST
         endpoint = url.rstrip("/")
-        if endpoint.endswith(".certification.TicketReservation") and self.reservation_overrides:
-            key = "params" if "params" in kwargs else "data"
-            kwargs[key] = {**(kwargs.get(key) or {}), **self.reservation_overrides}
+        operation, stage = _request_context(endpoint, self.reservation_active)
+        self.last_operation, self.last_stage = operation, stage
+        if (
+            endpoint.endswith(".certification.TicketReservation")
+            or endpoint == _RESERVATION_WAIT
+        ):
+            # A redirect could follow a completed write and turn a later connect
+            # timeout into a false "not sent" signal. Never follow one here.
+            kwargs["allow_redirects"] = False
+            if endpoint.endswith(".certification.TicketReservation") and self.reservation_overrides:
+                key = "params" if "params" in kwargs else "data"
+                kwargs[key] = {**(kwargs.get(key) or {}), **self.reservation_overrides}
         with _PACE_LOCK:
             delay = _NEXT_REQUEST - time.monotonic()
             if delay > 0:
@@ -69,13 +100,37 @@ class _PacedSession(requests.Session):
             # multiple local processes, so cross-process coordination adds no value.
             _NEXT_REQUEST = time.monotonic() + self.interval + random.uniform(0.0, 0.5)
         kwargs.setdefault("timeout", self.timeout)
-        response = super().request(method, url, **kwargs)
+        try:
+            response = super().request(method, url, **kwargs)
+        except Exception as exc:
+            if operation == "reserve" and stage == "initial" and isinstance(
+                exc, requests.ConnectTimeout
+            ):
+                self._diagnose(operation, stage, "not_sent", exc=exc)
+                raise ReservationNotSent() from None
+            outcome = "ambiguous" if operation == "reserve" else "transient"
+            self._diagnose(operation, stage, outcome, exc=exc)
+            raise
+        if operation == "reserve" and 300 <= response.status_code < 400:
+            exc = requests.HTTPError(response=response)
+            self._diagnose(operation, stage, "ambiguous", response=response, exc=exc)
+            raise exc
         if response.status_code == 429:
             retry = _retry_after(response.headers.get("Retry-After"))
             if retry is not None:
                 with _PACE_LOCK:
                     _NEXT_REQUEST = max(_NEXT_REQUEST, time.monotonic() + retry)
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            outcome = (
+                "blocked"
+                if response.status_code in (401, 403)
+                else "ambiguous" if operation == "reserve" else "transient"
+            )
+            self._diagnose(operation, stage, outcome, response=response, exc=exc)
+            raise
+        self._diagnose(operation, stage, "received", response=response)
         if endpoint.endswith(".seatMovie.ScheduleView"):
             self._capture_search_status(response)
         elif endpoint.endswith(".certification.TicketReservation"):
@@ -89,6 +144,24 @@ class _PacedSession(requests.Session):
         elif endpoint.endswith(".myTicket.MyTicketList"):
             self._capture_ticket_status(response)
         return response
+
+    def _diagnose(self, operation, stage, outcome, *, response=None, exc=None) -> None:
+        code = None
+        if response is not None:
+            try:
+                payload = response.json()
+                code = payload.get("h_msg_cd") if isinstance(payload, dict) else None
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        diagnostics.event(
+            "provider",
+            operation=operation,
+            stage=stage,
+            outcome=outcome,
+            http_status=getattr(response, "status_code", None),
+            provider_code=_safe_provider_code(code),
+            error_type=_safe_error_type(type(exc).__name__) if exc is not None else None,
+        )
 
     def _capture_search_status(self, response) -> None:
         snapshot: dict[str, tuple[str | None, str | None]] = {}
@@ -199,7 +272,7 @@ class KorailProvider:
             with contextlib.redirect_stdout(io.StringIO()):
                 authenticated = client.login()
         except Exception as exc:
-            self._raise(exc)
+            self._raise(exc, operation="login")
         if not authenticated:
             raise BlockedError("Korail authentication was rejected")
         self._client = client
@@ -219,11 +292,11 @@ class KorailProvider:
         except Exception as exc:
             if isinstance(exc, sdk.NoResultsError):
                 return []
-            self._raise(exc)
+            self._raise(exc, operation="search")
         try:
             return [self._train(train) for train in raw_trains]
         except Exception as exc:
-            self._raise(exc)
+            self._raise(exc, operation="search")
 
     def reserve(self, train: Train, seat_class: str, adults: int) -> Hold:
         client, sdk = self._ready()
@@ -250,64 +323,72 @@ class KorailProvider:
         ):
             raise SoldOut("this train has no supported standing inventory")
 
-        self._session.last_reservation_response = None
-        overrides = {}
-        raw = train.raw
-        try_waiting = seat_class == "waitlist"
-        if seat_class == "waitlist":
-            # The pinned SDK selects 1101 from stale seat availability before
-            # consulting try_waiting. The app instead keys queue intent on the
-            # exact h_wait_rsv_flg=9 search flag, so pin the evidenced job id.
-            overrides = {
-                "txtJobId": "1102",
-                "txtStndFlg": "Y" if train.standing else "N",
-            }
-        elif seat_class == "standing":
-            overrides = {"txtStndFlg": "Y"}
-            raw = _StandingPreflightTrain(train.raw)
-        self._session.reservation_overrides = overrides
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                reservation = client.reserve(
-                    raw,
-                    [sdk.AdultPassenger(adults)],
-                    option=options[seat_class],
-                    try_waiting=try_waiting,
-                )
-        except Exception as exc:
-            if seat_class != "waitlist" or self._standby_reference() is None:
-                self._raise(exc, mutation=True)
+        with self._session.reservation_attempt():
+            self._session.last_reservation_response = None
+            overrides = {}
+            raw = train.raw
+            try_waiting = seat_class == "waitlist"
+            if seat_class == "waitlist":
+                # The pinned SDK selects 1101 from stale seat availability before
+                # consulting try_waiting. The app instead keys queue intent on the
+                # exact h_wait_rsv_flg=9 search flag, so pin the evidenced job id.
+                overrides = {
+                    "txtJobId": "1102",
+                    "txtStndFlg": "Y" if train.standing else "N",
+                }
+            elif seat_class == "standing":
+                overrides = {"txtStndFlg": "Y"}
+                raw = _StandingPreflightTrain(train.raw)
+            self._session.reservation_overrides = overrides
             try:
-                self._raise(exc, mutation=True)
-            except BlockedError:
-                raise
-            except Exception:
-                pass
-            reservation = None
-        finally:
-            self._session.reservation_overrides = {}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    reservation = client.reserve(
+                        raw,
+                        [sdk.AdultPassenger(adults)],
+                        option=options[seat_class],
+                        try_waiting=try_waiting,
+                    )
+            except Exception as exc:
+                if seat_class != "waitlist" or self._standby_reference() is None:
+                    self._raise(exc, mutation=True, operation="reserve")
+                try:
+                    self._raise(exc, mutation=True, operation="reserve")
+                except BlockedError:
+                    raise
+                except Exception:
+                    pass
+                reservation = None
+            finally:
+                self._session.reservation_overrides = {}
 
-        if seat_class == "waitlist":
-            return self._confirm_waitlist(train)
-        if reservation is None:
-            raise AmbiguousReservation("Korail did not return the created reservation")
-        try:
-            hold = self._hold(reservation, paid=False)
-            accepted = {"standing", "seated"} if seat_class == "standing" else {"seated"}
-            if hold.kind not in accepted:
-                raise ValueError
-            return hold
-        except Exception as exc:
-            if isinstance(exc, BlockedError):
-                raise
-            raise AmbiguousReservation("Korail reservation outcome is unknown") from None
+            if seat_class == "waitlist":
+                return self._confirm_waitlist(train)
+            if reservation is None:
+                raise AmbiguousReservation("Korail did not return the created reservation")
+            try:
+                hold = self._hold(reservation, paid=False)
+                accepted = {"standing", "seated"} if seat_class == "standing" else {"seated"}
+                if hold.kind not in accepted:
+                    raise ValueError
+                return hold
+            except Exception as exc:
+                if isinstance(exc, BlockedError):
+                    raise
+                diagnostics.event(
+                    "provider",
+                    operation="reserve",
+                    stage="readback",
+                    outcome="ambiguous",
+                    error_type=_safe_error_type(type(exc).__name__),
+                )
+                raise AmbiguousReservation("Korail reservation outcome is unknown") from None
 
     def reservations(self) -> list[Hold]:
         client, _ = self._ready()
         try:
             return [self._hold(item, paid=False) for item in client.reservations()]
         except Exception as exc:
-            self._raise(exc)
+            self._raise(exc, operation="reservations")
 
     def tickets(self) -> list[Hold]:
         client, _ = self._ready()
@@ -327,7 +408,7 @@ class KorailProvider:
                 raise AmbiguousReservation("Korail ticket list is incomplete")
             return holds
         except Exception as exc:
-            self._raise(exc)
+            self._raise(exc, operation="tickets")
 
     def _ready(self):
         if self._client is None or self._sdk is None:
@@ -442,7 +523,7 @@ class KorailProvider:
             matches = [item for item in self.reservations() if item.reference == reference]
         except Exception as exc:
             try:
-                self._raise(exc, mutation=True)
+                self._raise(exc, mutation=True, operation="reserve")
             except BlockedError:
                 raise
             except Exception:
@@ -451,36 +532,143 @@ class KorailProvider:
             raise AmbiguousReservation("Korail waitlist outcome is unknown")
         return matches[0]
 
-    def _raise(self, exc: Exception, *, mutation: bool = False):
-        if isinstance(exc, (SoldOut, TransientError, BlockedError, AmbiguousReservation)):
+    def _raise(self, exc: Exception, *, mutation: bool = False, operation: str = "provider"):
+        stage = (
+            self._session.last_stage
+            if self._session.last_operation == operation
+            else "request"
+        )
+        accepted = self._initial_reservation_possible()
+
+        if isinstance(exc, ReservationNotSent):
+            if mutation and stage == "initial" and not accepted:
+                raise exc
+            self._diagnose_error(operation, stage, "ambiguous", exc)
+            raise AmbiguousReservation("Korail reservation outcome is unknown") from None
+        if isinstance(exc, TransientError):
+            if mutation:
+                self._diagnose_error(operation, stage, "ambiguous", exc)
+                raise AmbiguousReservation("Korail reservation outcome is unknown") from None
+            raise exc
+        if isinstance(exc, SoldOut):
+            if mutation and (stage != "preflight" or accepted):
+                self._diagnose_error(operation, stage, "ambiguous", exc)
+                raise AmbiguousReservation("Korail reservation outcome is unknown") from None
+            self._diagnose_error(operation, stage, "sold_out", exc)
+            raise exc
+        if isinstance(exc, (BlockedError, AmbiguousReservation)):
             raise exc
         sdk = self._sdk
         if sdk is not None and isinstance(exc, sdk.SoldOutError):
+            safe = stage == "preflight" or (
+                stage == "initial" and self._initial_sold_out_response()
+            )
+            if mutation and (not safe or accepted):
+                self._diagnose_error(operation, stage, "ambiguous", exc)
+                raise AmbiguousReservation("Korail reservation outcome is unknown") from None
+            self._diagnose_error(operation, stage, "sold_out", exc)
             raise SoldOut from None
         if sdk is not None and isinstance(exc, sdk.NeedToLoginError):
+            self._diagnose_error(operation, stage, "blocked", exc)
             raise BlockedError("Korail authentication is required") from None
 
         if isinstance(exc, requests.HTTPError):
             response = exc.response
             status = response.status_code if response is not None else None
             if status in (401, 403):
+                self._diagnose_error(operation, stage, "blocked", exc)
                 raise BlockedError("Korail rejected the authenticated session") from None
             retry = _retry_after(response.headers.get("Retry-After")) if response is not None else None
             if mutation:
+                self._diagnose_error(operation, stage, "ambiguous", exc)
                 raise AmbiguousReservation("Korail reservation outcome is unknown") from None
+            self._diagnose_error(operation, stage, "transient", exc)
             raise TransientError(retry_after=retry) from None
         if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
             if mutation:
+                self._diagnose_error(operation, stage, "ambiguous", exc)
                 raise AmbiguousReservation("Korail reservation outcome is unknown") from None
+            self._diagnose_error(operation, stage, "transient", exc)
             raise TransientError() from None
 
         if sdk is not None and isinstance(exc, sdk.KorailError):
             signal = f"{getattr(exc, 'code', '')} {getattr(exc, 'msg', '')}".lower()
             if any(word in signal for word in ("login", "auth", "security", "blocked", "차단", "로그인", "인증")):
+                self._diagnose_error(operation, stage, "blocked", exc)
                 raise BlockedError("Korail reported an authentication or security block") from None
         if mutation:
+            self._diagnose_error(operation, stage, "ambiguous", exc)
             raise AmbiguousReservation("Korail reservation outcome is unknown") from None
+        self._diagnose_error(operation, stage, "transient", exc)
         raise TransientError() from None
+
+    def _initial_reservation_possible(self) -> bool:
+        payload = self._session.last_reservation_response
+        return bool(
+            isinstance(payload, dict)
+            and (
+                payload.get("strResult") == "SUCC"
+                or payload.get("h_pnr_no") not in (None, "")
+            )
+        )
+
+    def _initial_sold_out_response(self) -> bool:
+        payload = self._session.last_reservation_response
+        return bool(
+            isinstance(payload, dict)
+            and payload.get("strResult") == "FAIL"
+            and payload.get("h_msg_cd") == "ERR211161"
+            and payload.get("h_pnr_no") in (None, "")
+        )
+
+    def _diagnose_error(self, operation: str, stage: str, outcome: str, exc: Exception) -> None:
+        response = exc.response if isinstance(exc, requests.HTTPError) else None
+        code = getattr(exc, "code", None)
+        if code is None and response is not None:
+            try:
+                payload = response.json()
+                code = payload.get("h_msg_cd") if isinstance(payload, dict) else None
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        diagnostics.event(
+            "provider",
+            operation=operation,
+            stage=stage,
+            outcome=outcome,
+            http_status=getattr(response, "status_code", None),
+            provider_code=_safe_provider_code(code),
+            error_type=_safe_error_type(type(exc).__name__),
+        )
+
+
+def _request_context(endpoint: str, reservation_active: bool) -> tuple[str, str]:
+    if endpoint.endswith(".login.Login"):
+        return "login", "request"
+    if endpoint.endswith(".seatMovie.ScheduleView"):
+        return "search", "request"
+    if endpoint.endswith(".certification.TicketReservation"):
+        return "reserve", "initial"
+    if endpoint == _RESERVATION_WAIT:
+        return "reserve", "followup"
+    if endpoint.endswith(".reservation.ReservationView"):
+        return ("reserve", "readback") if reservation_active else ("reservations", "request")
+    if endpoint.endswith(".myTicket.MyTicketList"):
+        return "tickets", "list"
+    if endpoint.endswith(".refunds.SelTicketInfo"):
+        return "tickets", "detail"
+    return "provider", "request"
+
+
+def _safe_provider_code(value) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 16 or not value.isascii():
+        return None
+    return value if "A" <= value[0] <= "Z" and value.isalnum() else None
+
+
+def _safe_error_type(value: str) -> str | None:
+    if not 1 <= len(value) <= 64 or not value.isascii() or not value[0].isalpha():
+        return None
+    return value if all(character.isalnum() or character == "_" for character in value) else None
 
 
 def _date(value: str) -> str:

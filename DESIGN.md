@@ -96,6 +96,16 @@ issues, artifacts, or Git history.
   429 Retry-After interpreted into TransientError. Telegram optional only for
   offline demo/read-only search; required/preflight for armed booking.
 
+`korail_watch/diagnostics.py` (ops owner):
+- `configure(state_dir: Path)` creates a private rotating
+  `diagnostics.jsonl` before provider login (about 1 MiB, three backups).
+- `event(event: str, **safe_fields)` accepts only bounded structured fields:
+  operation, stage, outcome, HTTP status, provider code, exception class, and
+  random attempt ID. It rejects raw text, URLs, payloads, headers, and identifiers.
+- Startup configuration failure is sanitized and fatal before mutation; later
+  logging failures never interrupt a successful provider mutation or state write.
+- The diagnostics logger has no root propagation or third-party HTTP handlers.
+
 `korail_watch/engine.py` (core owner):
 - `run(trip, provider, notifier, state_dir: Path, *, armed=False,
   once=False, max_cycles=None, continuous=False) -> str` and
@@ -104,6 +114,12 @@ issues, artifacts, or Git history.
   sold-out alternatives, stop at trip cutoff. Injection of sleep/clock accepted
   if useful for deterministic tests. Provider owns all network throttling.
 - Dry-run never calls reserve; --once performs bounded read-only coverage.
+- Deferred waitlist candidates are refreshed exactly before intent persistence.
+  Stale candidates skip safely and transient read-only refresh failures back off;
+  possible mutation dispatch or incomplete follow-up remains ambiguous.
+- Only an initial connection-establishment timeout with redirects disabled and
+  default transport retries set to zero is proven not dispatched. Generic
+  connection/read/HTTP errors after possible dispatch remain ambiguous.
 - Define CLI-facing demo provider or expose `demo(state_dir)` if convenient.
 
 `korail_watch/cli.py` (ops owner): argparse commands `check`, `watch --arm`,

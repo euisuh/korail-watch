@@ -73,6 +73,39 @@ class CliTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "at least 5"):
                 cli.provider_interval(config)
 
+    def test_diagnostics_are_configured_before_login_for_network_commands(self):
+        class Provider:
+            supported_modes = frozenset()
+
+            def login(self):
+                calls.append("login")
+
+        class Notifier:
+            def send(self, _text):
+                pass
+
+        for command in ("check", "watch"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                calls = []
+                config = self._trip_config(directory)
+                state = Path(directory) / "state"
+                argv = [command, "--config", str(config), "--state-dir", str(state)]
+                if command == "watch":
+                    argv.append("--arm")
+                env = {
+                    "KORAIL_ID": "member",
+                    "KORAIL_PASSWORD": "password",
+                    "TELEGRAM_BOT_TOKEN": "123456:abcdefghijklmnopqrstuvwxyzABCDEFGH",
+                    "TELEGRAM_CHAT_ID": "123",
+                }
+                with patch.dict(os.environ, env, clear=True), patch(
+                    "korail_watch.diagnostics.configure", side_effect=lambda path: calls.append(("configure", path))
+                ), patch("korail_watch.korail.KorailProvider", return_value=Provider()), patch(
+                    "korail_watch.notifier.TelegramNotifier", return_value=Notifier()
+                ), patch("korail_watch.engine.run", return_value="not-found"):
+                    self.assertEqual(0, cli.main(argv))
+                self.assertEqual([("configure", state), "login"], calls)
+
     def test_trip_reservation_modes_default_off_and_load_booleans(self):
         with tempfile.TemporaryDirectory() as directory:
             legacy = cli.load_trip(self._trip_config(directory))

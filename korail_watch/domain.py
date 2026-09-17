@@ -143,6 +143,10 @@ class TransientError(Exception):
         self.retry_after = retry_after
 
 
+class ReservationNotSent(TransientError):
+    """A reservation transport failed before its request was dispatched."""
+
+
 class BlockedError(Exception):
     """Authentication, queue, or security policy stopped the operation."""
 
