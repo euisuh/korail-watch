@@ -114,13 +114,18 @@ def _parser() -> argparse.ArgumentParser:
 
     for name, help_text in (
         ("check", "run one read-only search"),
-        ("watch", "watch and reserve the first eligible seat"),
+        ("watch", "watch for an eligible entitlement"),
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--config", type=Path, default=Path("trip.toml"))
         command.add_argument("--state-dir", type=Path, default=None)
         if name == "watch":
             command.add_argument("--arm", action="store_true", required=True)
+            command.add_argument(
+                "--continuous",
+                action="store_true",
+                help="continue after verified expiry or payment until trip cutoff",
+            )
 
     status_parser = commands.add_parser("status", help="show durable watcher state")
     status_parser.add_argument("--state-dir", type=Path, default=None)
@@ -131,6 +136,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def _state_dir(value: Path | None) -> Path:
     return value if value is not None else default_state_dir()
+
+
+def _status_for_display(value):
+    if isinstance(value, list):
+        return [_status_for_display(item) for item in value]
+    if isinstance(value, dict):
+        displayed = {key: _status_for_display(item) for key, item in value.items()}
+        if value.get("paid") is True and "reference" in value:
+            displayed["reference"] = "[redacted]"
+        return displayed
+    return value
 
 
 def _warn_unsupported(trip, provider) -> None:
@@ -156,7 +172,8 @@ def _execute(args: argparse.Namespace) -> str:
     if args.command == "status":
         from .engine import status
 
-        return json.dumps(status(_state_dir(args.state_dir)), ensure_ascii=False, indent=2, default=str)
+        snapshot = _status_for_display(status(_state_dir(args.state_dir)))
+        return json.dumps(snapshot, ensure_ascii=False, indent=2, default=str)
 
     if args.command == "demo":
         from .engine import demo
@@ -190,9 +207,17 @@ def _execute(args: argparse.Namespace) -> str:
     from .notifier import TelegramNotifier
 
     notifier = TelegramNotifier()
-    notifier.send("Korail Watch is armed and starting.")
-    print("Armed watch started; Ctrl-C stops it.", flush=True)
-    return run(trip, provider, notifier, _state_dir(args.state_dir), armed=True)
+    mode = " continuously" if args.continuous else ""
+    notifier.send(f"Korail Watch is armed and starting{mode}.")
+    print(f"Armed watch started{mode}; Ctrl-C stops it.", flush=True)
+    return run(
+        trip,
+        provider,
+        notifier,
+        _state_dir(args.state_dir),
+        armed=True,
+        continuous=args.continuous,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

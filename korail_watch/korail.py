@@ -24,6 +24,9 @@ _RESERVATION_WAIT = (
     "https://smart.letskorail.com:443/classes/"
     "com.korail.mobile.reservationWait.ReservationWait"
 )
+# MyTicketList's observed empty code plus the pinned SDK's generic no-result
+# codes. Its train-search-only WRD000061 code is deliberately excluded.
+_EMPTY_TICKET_CODES = frozenset(("WRT300005", "P100", "WRG000000"))
 
 
 def _retry_after(value: str | None) -> float | None:
@@ -47,6 +50,8 @@ class _PacedSession(requests.Session):
             str, tuple[str | None, int | None, int | None] | None
         ] = {}
         self.search_status: dict[str, tuple[str | None, str | None]] = {}
+        self.ticket_status: dict[str, tuple[str, str]] = {}
+        self.ticket_complete = False
         self.reservation_overrides: dict[str, str] = {}
         self.last_reservation_response: dict | None = None
 
@@ -81,6 +86,8 @@ class _PacedSession(requests.Session):
             self.last_reservation_response = payload if isinstance(payload, dict) else None
         elif endpoint.endswith(".reservation.ReservationView"):
             self._capture_reservation_status(response)
+        elif endpoint.endswith(".myTicket.MyTicketList"):
+            self._capture_ticket_status(response)
         return response
 
     def _capture_search_status(self, response) -> None:
@@ -112,6 +119,57 @@ class _PacedSession(requests.Session):
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             pass
         self.reservation_status = snapshot
+
+    def _capture_ticket_status(self, response) -> None:
+        self.ticket_status = {}
+        self.ticket_complete = False
+        try:
+            payload = response.json()
+            if payload.get("h_msg_cd") in _EMPTY_TICKET_CODES:
+                if (
+                    payload.get("strResult") in ("SUCC", "FAIL")
+                    and payload.get("tickets") in (None, [])
+                    and payload.get("reservation_list") in (None, [])
+                ):
+                    self.ticket_complete = True
+                return
+            if payload.get("strResult") != "SUCC":
+                return
+
+            records = payload["reservation_list"]
+            if not isinstance(records, list):
+                return
+            snapshot: dict[str, tuple[str, str]] = {}
+            for record in records:
+                ticket_list = record["ticket_list"]
+                if not isinstance(ticket_list, list) or len(ticket_list) != 1:
+                    return
+                train_info = ticket_list[0]["train_info"]
+                if not isinstance(train_info, list) or len(train_info) != 1:
+                    return
+                row = train_info[0]
+                if not isinstance(row, dict) or row.get("h_psg_tp_cd") != "1":
+                    return
+                if _integer(row.get("h_seat_cnt")) != 1:
+                    return
+                pnr = _required(row, "h_pnr_no")
+                reference = "-".join(
+                    _required(row, name)
+                    for name in (
+                        "h_orgtk_wct_no",
+                        "h_orgtk_ret_sale_dt",
+                        "h_orgtk_sale_sqno",
+                        "h_orgtk_ret_pwd",
+                    )
+                )
+                record_key = _record_key(row)
+                if not all(record_key.split("|")) or reference in snapshot:
+                    return
+                snapshot[reference] = (pnr, record_key)
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return
+        self.ticket_status = snapshot
+        self.ticket_complete = True
 
 
 class KorailProvider:
@@ -253,8 +311,21 @@ class KorailProvider:
 
     def tickets(self) -> list[Hold]:
         client, _ = self._ready()
+        self._session.ticket_status = {}
+        self._session.ticket_complete = False
         try:
-            return [self._hold(item, paid=True) for item in client.tickets()]
+            try:
+                raw_tickets = client.tickets()
+            except Exception:
+                if self._session.ticket_complete and not self._session.ticket_status:
+                    return []
+                raise
+            if not self._session.ticket_complete or not isinstance(raw_tickets, list):
+                raise AmbiguousReservation("Korail ticket list is incomplete")
+            holds = [self._hold(item, paid=True) for item in raw_tickets]
+            if len(holds) != len(self._session.ticket_status):
+                raise AmbiguousReservation("Korail ticket list is incomplete")
+            return holds
         except Exception as exc:
             self._raise(exc)
 
@@ -301,7 +372,8 @@ class KorailProvider:
             reference = raw.get_ticket_no()
             deadline = None
             seats = _integer(getattr(raw, "seat_no_count", None))
-            if seats == 1:
+            status = self._session.ticket_status.get(str(reference))
+            if seats == 1 and status is not None and status[1] == _raw_key(raw):
                 kind = "seated"
             else:
                 raise AmbiguousReservation("Korail ticket seating status is unavailable")
@@ -442,6 +514,13 @@ def _record_key(raw: dict) -> str:
             "h_arv_tm",
         )
     )
+
+
+def _required(raw: dict, name: str) -> str:
+    value = raw.get(name)
+    if not isinstance(value, str) or not value:
+        raise ValueError
+    return value
 
 
 def _raw_key(raw) -> str:
