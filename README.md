@@ -200,6 +200,13 @@ may have been dispatched, uncertainty or incomplete follow-up still stops safely
 Diagnostics cannot reconstruct the cause of incidents that occurred before this
 logging existed.
 
+Safe automatic recovery at the mutation boundary is deliberately narrow: only an
+initial connection-establishment timeout can be classified as not dispatched,
+with redirects disabled and the transport's default retries set to zero. Generic
+connection, read, or HTTP errors after possible dispatch—and any incomplete
+waitlist follow-up—remain uncertain and stop for review. An unconfirmed outcome
+is not proof that Korail rejected the request.
+
 The watcher uses one authenticated session, at least five seconds between
 requests, bounded retry behavior, and no parallel accounts, proxies, queue
 bypass, or automatic retries of uncertain reservation writes. It cannot

@@ -13,6 +13,7 @@ from korail_watch.domain import (
     AmbiguousReservation,
     BlockedError,
     Hold,
+    ReservationNotSent,
     SoldOut,
     Train,
     TransientError,
@@ -292,6 +293,206 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(run(requested, provider, Notifier(), self.state, armed=True, once=True), "available")
         self.assertEqual(provider.reserve_calls, [])
 
+    def test_waitlist_refresh_skips_missing_and_duplicate_exact_candidates(self):
+        candidate = train(dep_time="12:00", general=False, special=False, waitlist=True)
+        requested = trip(
+            start="12:00",
+            end="12:00",
+            departures=("서울",),
+            arrivals=("대전",),
+            allow_waitlist=True,
+        )
+
+        class Refreshing(QueueProvider):
+            def __init__(self, refresh):
+                super().__init__()
+                self.refresh = refresh
+
+            def search(self, requested, departure, arrival, after):
+                self.calls.append((departure, arrival, after))
+                if len(self.calls) == 1:
+                    return [candidate]
+                if len(self.calls) == 2:
+                    return []
+                return self.refresh
+
+        unavailable = train(
+            dep_time="12:00",
+            general=False,
+            special=False,
+            waitlist=False,
+        )
+        for name, refresh in (
+            ("missing", []),
+            ("duplicate", [candidate, candidate]),
+            ("unavailable", [unavailable]),
+        ):
+            with self.subTest(name=name):
+                state = self.state / name
+                provider = Refreshing(refresh)
+                self.assertEqual(
+                    run(requested, provider, Notifier(), state, armed=True, once=True),
+                    "available",
+                )
+                self.assertEqual(provider.reserve_calls, [])
+                self.assertIsNone(status(state)["intent"])
+
+    def test_waitlist_refresh_keeps_final_account_preflight(self):
+        candidate = train(dep_time="12:00", general=False, special=False, waitlist=True)
+        existing = Hold("OTHER", train(key="OTHER", dep_time="12:00"), None, None)
+
+        class Appearing(QueueProvider):
+            def __init__(self):
+                super().__init__()
+                self.reads = 0
+
+            def reservations(self):
+                self.reads += 1
+                return [] if self.reads == 1 else [existing]
+
+            def search(self, requested, departure, arrival, after):
+                self.calls.append((departure, arrival, after))
+                if len(self.calls) == 1:
+                    return [candidate]
+                if len(self.calls) == 2:
+                    return []
+                return [candidate]
+
+        provider = Appearing()
+        requested = trip(
+            start="12:00",
+            end="12:00",
+            departures=("서울",),
+            arrivals=("대전",),
+            allow_waitlist=True,
+        )
+        self.assertEqual(
+            run(
+                requested,
+                provider,
+                Notifier(),
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+            "existing-hold",
+        )
+        self.assertEqual(provider.reserve_calls, [])
+        self.assertEqual(status(self.state)["hold"]["reference"], "OTHER")
+
+    def test_waitlist_refresh_uses_fresh_raw_and_new_immediate_inventory(self):
+        stale_raw, fresh_raw = object(), object()
+        candidate = train(
+            dep_time="12:00",
+            general=False,
+            special=False,
+            raw=stale_raw,
+            waitlist=True,
+        )
+        refreshed = train(
+            dep_time="12:00",
+            general=True,
+            special=False,
+            raw=fresh_raw,
+            waitlist=False,
+        )
+
+        class Refreshing(QueueProvider):
+            def search(self, requested, departure, arrival, after):
+                self.calls.append((departure, arrival, after))
+                if len(self.calls) == 1:
+                    return [candidate]
+                if len(self.calls) == 2:
+                    return []
+                return [refreshed]
+
+            def reserve(self, selected, kind, adults):
+                self.reserve_calls.append((selected, kind, adults))
+                return Hold("FRESH", selected, None, None)
+
+        provider = Refreshing()
+        requested = trip(
+            start="12:00",
+            end="12:00",
+            departures=("서울",),
+            arrivals=("대전",),
+            allow_waitlist=True,
+        )
+        self.assertEqual(run(requested, provider, Notifier(), self.state, armed=True, once=True), "reserved")
+        self.assertIs(provider.reserve_calls[0][0].raw, fresh_raw)
+        self.assertEqual(provider.reserve_calls[0][1], "general")
+
+    def test_waitlist_refresh_transient_continues_scan_without_intent(self):
+        candidate = train(dep_time="12:00", general=False, special=False, waitlist=True)
+
+        class Refreshing(QueueProvider):
+            def search(self, requested, departure, arrival, after):
+                self.calls.append((departure, arrival, after))
+                if len(self.calls) == 1:
+                    return [candidate]
+                if len(self.calls) == 2:
+                    return []
+                if len(self.calls) == 3:
+                    raise TransientError(retry_after=7)
+                return []
+
+        provider = Refreshing()
+        requested = trip(
+            start="12:00",
+            end="12:00",
+            departures=("서울",),
+            arrivals=("대전",),
+            allow_waitlist=True,
+        )
+        with patch("korail_watch.engine.time.sleep") as sleep:
+            self.assertEqual(
+                run(
+                    requested,
+                    provider,
+                    Notifier(),
+                    self.state,
+                    armed=True,
+                    continuous=True,
+                    max_cycles=2,
+                ),
+                "incomplete",
+            )
+        sleep.assert_called_once_with(7)
+        self.assertGreaterEqual(len(provider.calls), 4)
+        self.assertEqual(provider.reserve_calls, [])
+        self.assertIsNone(status(self.state)["intent"])
+
+    def test_waitlist_refresh_crossing_cutoff_never_writes_intent(self):
+        candidate = train(dep_time="12:00", general=False, special=False, waitlist=True)
+        clock = [datetime(2099, 9, 24, 11, 0, tzinfo=KST)]
+
+        class Refreshing(QueueProvider):
+            def search(self, requested, departure, arrival, after):
+                self.calls.append((departure, arrival, after))
+                if len(self.calls) == 1:
+                    return [candidate]
+                if len(self.calls) == 2:
+                    return []
+                clock[0] = datetime(2099, 9, 24, 12, 0, tzinfo=KST)
+                return [candidate]
+
+        provider = Refreshing()
+        requested = trip(
+            start="12:00",
+            end="12:00",
+            departures=("서울",),
+            arrivals=("대전",),
+            allow_waitlist=True,
+        )
+        with patch("korail_watch.engine._now", side_effect=lambda: clock[0]):
+            self.assertEqual(
+                run(requested, provider, Notifier(), self.state, armed=True, once=True),
+                "available",
+            )
+        self.assertEqual(provider.reserve_calls, [])
+        self.assertIsNone(status(self.state)["intent"])
+
     def test_baseline_seated_modes_remain_supported_with_extra_mode_contract(self):
         class ExtraOnly(Provider):
             supported_modes = frozenset(("waitlist",))
@@ -396,6 +597,78 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(provider.reserve_calls), 1)
         self.assertEqual(run(trip(date="2099-09-25"), provider, Notifier(), self.state, armed=True, once=True), "ambiguous")
         self.assertEqual(len(provider.reserve_calls), 1)
+
+    def test_proven_not_sent_clears_only_intent_and_continues_after_retry_after(self):
+        selected = train()
+
+        class Recovering(Provider):
+            def reserve(self, selected, seat_class, adults):
+                self.reserve_calls.append((selected, seat_class, adults))
+                if len(self.reserve_calls) == 1:
+                    raise ReservationNotSent(retry_after=7)
+                return Hold("SAFE", selected, None, None)
+
+        provider = Recovering([selected])
+        with (
+            patch("korail_watch.engine.time.sleep") as sleep,
+            patch("korail_watch.engine.diagnostics.event") as event,
+        ):
+            self.assertEqual(
+                run(trip(), provider, Notifier(), self.state, armed=True, max_cycles=1),
+                "reserved",
+            )
+        sleep.assert_called_once_with(7)
+        self.assertEqual([call[1] for call in provider.reserve_calls], ["general", "special"])
+        snapshot = status(self.state)
+        self.assertIsNone(snapshot["intent"])
+        self.assertEqual(snapshot["hold"]["reference"], "SAFE")
+        not_sent = [
+            call.kwargs
+            for call in event.call_args_list
+            if call.args == ("reservation.result",) and call.kwargs.get("outcome") == "not_sent"
+        ]
+        self.assertEqual(len(not_sent), 1)
+        self.assertEqual(not_sent[0]["error_type"], "ReservationNotSent")
+        self.assertRegex(not_sent[0]["attempt_id"], r"^[0-9a-f]{32}$")
+
+    def test_generic_mutation_transient_keeps_intent_and_logs_terminal_ambiguity(self):
+        class UnknownDispatch(Provider):
+            def reserve(self, selected, seat_class, adults):
+                self.reserve_calls.append((selected, seat_class, adults))
+                raise TransientError("secret response", retry_after=7)
+
+        provider = UnknownDispatch([train()])
+        with patch("korail_watch.engine.diagnostics.event") as event:
+            self.assertEqual(
+                run(trip(), provider, Notifier(), self.state, armed=True, once=True),
+                "ambiguous",
+            )
+        self.assertIsNotNone(status(self.state)["intent"])
+        stop = [call for call in event.call_args_list if call.args == ("reservation.stop",)]
+        self.assertEqual(stop[-1].kwargs["outcome"], "ambiguous")
+        self.assertNotIn("secret", repr(stop[-1]))
+
+    def test_continuous_mutation_ambiguity_notice_explains_unconfirmed_outcome(self):
+        class UnknownDispatch(Provider):
+            def reserve(self, selected, seat_class, adults):
+                raise AmbiguousReservation()
+
+        notifier = Notifier()
+        self.assertEqual(
+            run(
+                trip(),
+                UnknownDispatch([train()]),
+                notifier,
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+            "ambiguous",
+        )
+        self.assertIn("could not be confirmed", notifier.messages[-1])
+        self.assertIn("not proof", notifier.messages[-1])
+        self.assertIn("diagnostics.jsonl", notifier.messages[-1])
 
     def test_mismatched_reservation_result_is_preserved_and_blocks(self):
         class Wrong(Provider):

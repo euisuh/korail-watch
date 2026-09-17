@@ -11,7 +11,15 @@ from unittest.mock import patch
 
 import requests
 
-from korail_watch.domain import AmbiguousReservation, BlockedError, Hold, SoldOut, TransientError, Trip
+from korail_watch.domain import (
+    AmbiguousReservation,
+    BlockedError,
+    Hold,
+    ReservationNotSent,
+    SoldOut,
+    TransientError,
+    Trip,
+)
 from korail_watch import korail
 from korail_watch.korail import KorailProvider
 from korail_watch.notifier import TelegramNotifier
@@ -70,6 +78,9 @@ class RawTrain:
 
     def has_special_seat(self):
         return False
+
+    def has_seat(self):
+        return self.has_general_seat() or self.has_special_seat()
 
     def has_general_waiting_list(self):
         return self.wait_reserve_flag == 9
@@ -250,6 +261,190 @@ class ProviderTests(unittest.TestCase):
         client.reserve = lambda *args, **kwargs: (_ for _ in ()).throw(_SoldOut())
         with self.assertRaises(SoldOut):
             provider(client).reserve(provider()._train(RawTrain()), "general", 1)
+
+    def test_only_initial_connect_timeout_is_proven_not_sent(self):
+        import korail2
+
+        adapter = KorailProvider()
+        client = korail2.Korail("member", "password", auto_login=False, want_feedback=False)
+        client._session = adapter._session
+        adapter._sdk, adapter._client = korail2, client
+        calls = []
+
+        def request(_session, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            raise requests.ConnectTimeout("must never be logged: credential=secret")
+
+        with patch.object(requests.Session, "request", request), patch.object(
+            korail.diagnostics, "event"
+        ) as event, self.assertRaises(ReservationNotSent):
+            adapter.reserve(adapter._train(RawTrain()), "general", 1)
+
+        self.assertFalse(calls[0][2]["allow_redirects"])
+        self.assertEqual(0, adapter._session.get_adapter(calls[0][1]).max_retries.total)
+        fields = event.call_args_list[0].kwargs
+        self.assertEqual(("reserve", "initial", "not_sent"), (
+            fields["operation"], fields["stage"], fields["outcome"]
+        ))
+        self.assertEqual("ConnectTimeout", fields["error_type"])
+        self.assertNotIn("secret", repr(event.call_args_list))
+
+    def test_initial_non_connect_failure_or_redirect_is_ambiguous(self):
+        import korail2
+
+        for failure in (requests.ReadTimeout(), requests.ConnectionError()):
+            with self.subTest(failure=type(failure).__name__):
+                adapter = KorailProvider()
+                client = korail2.Korail(
+                    "member", "password", auto_login=False, want_feedback=False
+                )
+                client._session = adapter._session
+                adapter._sdk, adapter._client = korail2, client
+                korail._NEXT_REQUEST = 0.0
+                with patch.object(requests.Session, "request", side_effect=failure), self.assertRaises(
+                    AmbiguousReservation
+                ):
+                    adapter.reserve(adapter._train(RawTrain()), "general", 1)
+
+        for status in (307, 503):
+            with self.subTest(http_status=status):
+                response = requests.Response()
+                response.status_code = status
+                response.headers["Location"] = "https://redirect.invalid/secret"
+                adapter = KorailProvider()
+                client = korail2.Korail(
+                    "member", "password", auto_login=False, want_feedback=False
+                )
+                client._session = adapter._session
+                adapter._sdk, adapter._client = korail2, client
+                korail._NEXT_REQUEST = 0.0
+                with patch.object(
+                    requests.Session, "request", return_value=response
+                ) as request, self.assertRaises(AmbiguousReservation):
+                    adapter.reserve(adapter._train(RawTrain()), "general", 1)
+                self.assertFalse(request.call_args.kwargs["allow_redirects"])
+
+    def test_successful_initial_write_makes_readback_errors_ambiguous(self):
+        import korail2
+
+        def response(payload, url):
+            result = requests.Response()
+            result.status_code = 200
+            result.url = url
+            result._content = json.dumps(payload).encode()
+            result.encoding = "utf-8"
+            return result
+
+        def request(_session, method, url, **kwargs):
+            if url.endswith(".certification.TicketReservation"):
+                return response({"strResult": "SUCC", "h_pnr_no": "private-pnr"}, url)
+            if url.endswith(".reservation.ReservationView"):
+                return response(
+                    {"strResult": "FAIL", "h_msg_cd": "ERR211161", "h_msg_txt": "sold out"},
+                    url,
+                )
+            raise AssertionError(f"unexpected offline endpoint: {url.rsplit('.', 1)[-1]}")
+
+        adapter = KorailProvider()
+        client = korail2.Korail("member", "password", auto_login=False, want_feedback=False)
+        client._session = adapter._session
+        adapter._sdk, adapter._client = korail2, client
+        with patch.object(requests.Session, "request", request), patch(
+            "korail_watch.korail.time.sleep"
+        ), self.assertRaises(AmbiguousReservation):
+            adapter.reserve(adapter._train(RawTrain()), "general", 1)
+
+        for accepted in (
+            {"strResult": "SUCC"},
+            {"strResult": "FAIL", "h_msg_cd": "ERR211161", "h_pnr_no": "private-pnr"},
+        ):
+            with self.subTest(accepted=accepted):
+                client = FakeClient()
+                adapter = provider(client)
+
+                def sold_out(*args, **kwargs):
+                    adapter._session.last_reservation_response = accepted
+                    adapter._session.last_operation, adapter._session.last_stage = "reserve", "initial"
+                    raise _SoldOut()
+
+                client.reserve = sold_out
+                with self.assertRaises(AmbiguousReservation):
+                    adapter.reserve(adapter._train(RawTrain()), "general", 1)
+
+        for failure in (ReservationNotSent(), SoldOut()):
+            with self.subTest(post_dispatch=type(failure).__name__):
+                client = FakeClient()
+                adapter = provider(client)
+
+                def reserve(*args, **kwargs):
+                    adapter._session.last_reservation_response = {
+                        "strResult": "SUCC",
+                        "h_pnr_no": "private-pnr",
+                    }
+                    adapter._session.last_operation, adapter._session.last_stage = "reserve", "readback"
+                    raise failure
+
+                client.reserve = reserve
+                with self.assertRaises(AmbiguousReservation):
+                    adapter.reserve(adapter._train(RawTrain()), "general", 1)
+
+    def test_exact_initial_provider_sold_out_remains_definitive(self):
+        import korail2
+
+        response = requests.Response()
+        response.status_code = 200
+        response.url = "https://smart.letskorail.com/TicketReservation"
+        response._content = json.dumps(
+            {"strResult": "FAIL", "h_msg_cd": "ERR211161", "h_msg_txt": "sold out"}
+        ).encode()
+        response.encoding = "utf-8"
+        adapter = KorailProvider()
+        client = korail2.Korail("member", "password", auto_login=False, want_feedback=False)
+        client._session = adapter._session
+        adapter._sdk, adapter._client = korail2, client
+
+        with patch.object(requests.Session, "request", return_value=response), self.assertRaises(
+            SoldOut
+        ):
+            adapter.reserve(adapter._train(RawTrain()), "general", 1)
+
+    def test_provider_diagnostics_keep_only_sanitized_status_and_code(self):
+        import korail2
+
+        client = FakeClient()
+        adapter = provider(client)
+        failure = korail2.KorailError(
+            "password=secret pnr=private-pnr https://example.invalid/?token=secret",
+            "ERR000001",
+        )
+        client.reserve = lambda *args, **kwargs: (_ for _ in ()).throw(failure)
+        with patch.object(korail.diagnostics, "event") as event, self.assertRaises(
+            AmbiguousReservation
+        ):
+            adapter.reserve(adapter._train(RawTrain()), "general", 1)
+
+        serialized = repr(event.call_args_list)
+        self.assertIn("ERR000001", serialized)
+        self.assertIn("KorailError", serialized)
+        for secret in ("password", "private-pnr", "example.invalid", "token"):
+            self.assertNotIn(secret, serialized)
+
+        response = requests.Response()
+        response.status_code = 503
+        response.url = "https://example.invalid/?token=secret"
+        response._content = json.dumps(
+            {"h_msg_cd": "ERR000002", "h_msg_txt": "pnr=private-pnr"}
+        ).encode()
+        failure = requests.HTTPError("password=secret", response=response)
+        client.reserve = lambda *args, **kwargs: (_ for _ in ()).throw(failure)
+        with patch.object(korail.diagnostics, "event") as event, self.assertRaises(
+            AmbiguousReservation
+        ):
+            adapter.reserve(adapter._train(RawTrain()), "general", 1)
+        fields = event.call_args.kwargs
+        self.assertEqual(503, fields["http_status"])
+        self.assertEqual("ERR000002", fields["provider_code"])
+        self.assertNotIn("secret", repr(event.call_args_list))
 
     def test_reconciliation_distinguishes_unpaid_and_paid(self):
         adapter = provider()
@@ -551,6 +746,7 @@ class ProviderTests(unittest.TestCase):
                 return response(first, url)
             if url == korail._RESERVATION_WAIT:
                 self.assertEqual("POST", method)
+                self.assertFalse(kwargs["allow_redirects"])
                 self.assertEqual("Y", kwargs["data"]["txtPsrmClChgFlg"])
                 self.assertNotIn("txtCpNo", kwargs["data"])
                 return response(followup, url)

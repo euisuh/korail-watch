@@ -117,6 +117,9 @@ issues, artifacts, or Git history.
 - Deferred waitlist candidates are refreshed exactly before intent persistence.
   Stale candidates skip safely and transient read-only refresh failures back off;
   possible mutation dispatch or incomplete follow-up remains ambiguous.
+- Only an initial connection-establishment timeout with redirects disabled and
+  default transport retries set to zero is proven not dispatched. Generic
+  connection/read/HTTP errors after possible dispatch remain ambiguous.
 - Define CLI-facing demo provider or expose `demo(state_dir)` if convenient.
 
 `korail_watch/cli.py` (ops owner): argparse commands `check`, `watch --arm`,

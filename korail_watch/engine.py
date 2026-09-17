@@ -7,17 +7,20 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from collections import deque
 from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
+from . import diagnostics
 from .domain import (
     KST,
     AmbiguousReservation,
     BlockedError,
     Hold,
+    ReservationNotSent,
     SoldOut,
     Train,
     TransientError,
@@ -457,8 +460,9 @@ def _preserve_account_unknown(db: sqlite3.Connection, reason: str, remote: list[
         db.execute(
             "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
             (
-                f"Korail continuous watch stopped ({reason}); check the official Korail app. "
-                "No new booking will be attempted.",
+                f"Korail continuous watch stopped ({reason}). A booking outcome could not be "
+                "confirmed; this is not proof that the request was blocked. Check the official "
+                "Korail app and the private diagnostics.jsonl file. No new booking will be attempted.",
             ),
         )
 
@@ -865,6 +869,10 @@ def _attempt(
     for kind, available in kinds:
         if not available:
             continue
+        if _past_cutoff(trip):
+            return "cutoff"
+        if not trip.matches(train):
+            return None
         if continuous:
             while True:
                 if _past_cutoff(trip):
@@ -890,33 +898,112 @@ def _attempt(
                 return None
             if preflight:
                 return preflight
-        intent = {"train": _train_data(train), "kind": kind, "adults": trip.adults, "created_at": _now().isoformat()}
+        attempt_id = uuid.uuid4().hex
+        intent = {
+            "train": _train_data(train),
+            "kind": kind,
+            "adults": trip.adults,
+            "created_at": _now().isoformat(),
+            "attempt_id": attempt_id,
+        }
         with db:
             _set(db, "intent", intent)
+        diagnostics.event(
+            "reservation.attempt",
+            operation="reserve",
+            stage="dispatch",
+            outcome="starting",
+            attempt_id=attempt_id,
+        )
         try:
             hold = provider.reserve(train, kind, trip.adults)
+        except ReservationNotSent as exc:
+            with db:
+                db.execute("DELETE FROM state WHERE key = 'intent'")
+            diagnostics.event(
+                "reservation.result",
+                operation="reserve",
+                stage="dispatch",
+                outcome="not_sent",
+                error_type=type(exc).__name__,
+                attempt_id=attempt_id,
+            )
+            if not wait:
+                return "incomplete"
+            delay = max(1.0, exc.retry_after if exc.retry_after is not None else 30.0)
+            remaining = _until_cutoff(trip)
+            if not remaining:
+                return "cutoff"
+            time.sleep(min(delay, remaining))
+            if _past_cutoff(trip) or not trip.matches(train):
+                return "cutoff" if _past_cutoff(trip) else None
+            continue
         except SoldOut:
             with db:
                 db.execute("DELETE FROM state WHERE key = 'intent'")
+            diagnostics.event(
+                "reservation.result",
+                operation="reserve",
+                stage="response",
+                outcome="sold_out",
+                attempt_id=attempt_id,
+            )
             continue
-        except BlockedError:
+        except BlockedError as exc:
             result = _reconcile(db, trip, provider, continuous=continuous)
+            diagnostics.event(
+                "reservation.stop",
+                operation="reserve",
+                stage="reconcile",
+                outcome=result or "blocked",
+                error_type=type(exc).__name__,
+                attempt_id=attempt_id,
+            )
             return result or "blocked"
-        except (AmbiguousReservation, TransientError, Exception):
+        except Exception as exc:
             result = _reconcile(db, trip, provider, continuous=continuous)
+            diagnostics.event(
+                "reservation.stop",
+                operation="reserve",
+                stage="reconcile",
+                outcome=result or "ambiguous",
+                error_type=type(exc).__name__,
+                attempt_id=attempt_id,
+            )
             return result or "ambiguous"
         expected = "seated" if kind in ("general", "special") else kind
         accepted_kind = isinstance(hold, Hold) and (
             hold.kind == expected or (kind == "standing" and hold.kind == "seated")
         )
         if not isinstance(hold, Hold) or not _same_train(hold.train, train) or not accepted_kind:
+            diagnostics.event(
+                "reservation.result",
+                operation="reserve",
+                stage="validate",
+                outcome="ambiguous",
+                attempt_id=attempt_id,
+            )
             if isinstance(hold, Hold):
                 _preserve_mismatch(db, hold)
             return "ambiguous"
         if hold.kind == "waitlist":
             _confirm_queue(db, hold)
+            diagnostics.event(
+                "reservation.result",
+                operation="reserve",
+                stage="confirm",
+                outcome="confirmed",
+                attempt_id=attempt_id,
+            )
             return "waitlisted"
         _confirm(db, hold)
+        diagnostics.event(
+            "reservation.result",
+            operation="reserve",
+            stage="confirm",
+            outcome="confirmed",
+            attempt_id=attempt_id,
+        )
         return "reserved"
     return None
 
@@ -1028,13 +1115,132 @@ def _search(
         if armed and waitlist_candidates and not pass_incomplete:
             for candidate in waitlist_candidates:
                 if not trip.matches(candidate):
+                    diagnostics.event(
+                        "waitlist.refresh",
+                        operation="search",
+                        stage="candidate_refresh",
+                        outcome="departed",
+                    )
                     continue
+                diagnostics.event(
+                    "waitlist.refresh",
+                    operation="search",
+                    stage="candidate_refresh",
+                    outcome="starting",
+                )
+                try:
+                    refreshed = provider.search(
+                        trip,
+                        candidate.departure,
+                        candidate.arrival,
+                        candidate.dep_time + ":00",
+                    )
+                except TransientError as exc:
+                    incomplete = True
+                    diagnostics.event(
+                        "waitlist.refresh",
+                        operation="search",
+                        stage="candidate_refresh",
+                        outcome="transient",
+                        error_type=type(exc).__name__,
+                    )
+                    if once:
+                        continue
+                    remaining = _until_cutoff(trip)
+                    if not remaining:
+                        return "cutoff"
+                    delay = max(1.0, exc.retry_after if exc.retry_after is not None else 5.0)
+                    time.sleep(min(delay, remaining))
+                    if _past_cutoff(trip):
+                        return "cutoff"
+                    continue
+                except BlockedError as exc:
+                    diagnostics.event(
+                        "waitlist.refresh",
+                        operation="search",
+                        stage="candidate_refresh",
+                        outcome="blocked",
+                        error_type=type(exc).__name__,
+                    )
+                    return "blocked"
+                except Exception as exc:
+                    diagnostics.event(
+                        "waitlist.refresh",
+                        operation="search",
+                        stage="candidate_refresh",
+                        outcome="error",
+                        error_type=type(exc).__name__,
+                    )
+                    return "error"
+                if not isinstance(refreshed, list) or any(
+                    not isinstance(item, Train) for item in refreshed
+                ):
+                    diagnostics.event(
+                        "waitlist.refresh",
+                        operation="search",
+                        stage="candidate_refresh",
+                        outcome="invalid",
+                    )
+                    return "error"
+                exact = [item for item in refreshed if _same_train(item, candidate)]
+                if len(exact) != 1:
+                    diagnostics.event(
+                        "waitlist.refresh",
+                        operation="search",
+                        stage="candidate_refresh",
+                        outcome="missing" if not exact else "duplicate",
+                    )
+                    continue
+                refreshed_candidate = exact[0]
+                if _past_cutoff(trip) or not trip.matches(refreshed_candidate):
+                    diagnostics.event(
+                        "waitlist.refresh",
+                        operation="search",
+                        stage="candidate_refresh",
+                        outcome="departed",
+                    )
+                    continue
+                refreshed_kinds = (
+                    ("general", refreshed_candidate.general and "general" in supported),
+                    ("special", refreshed_candidate.special and "special" in supported),
+                    (
+                        "standing",
+                        refreshed_candidate.standing
+                        and trip.allow_standing
+                        and "standing" in supported,
+                    ),
+                    ("mixed", refreshed_candidate.mixed and trip.allow_mixed and "mixed" in supported),
+                    (
+                        "waitlist",
+                        refreshed_candidate.waitlist
+                        and trip.allow_waitlist
+                        and "waitlist" in supported,
+                    ),
+                )
+                if not any(enabled for _, enabled in refreshed_kinds):
+                    diagnostics.event(
+                        "waitlist.refresh",
+                        operation="search",
+                        stage="candidate_refresh",
+                        outcome="unavailable",
+                    )
+                    continue
+                diagnostics.event(
+                    "waitlist.refresh",
+                    operation="search",
+                    stage="candidate_refresh",
+                    outcome=(
+                        "immediate"
+                        if any(enabled for kind, enabled in refreshed_kinds if kind != "waitlist")
+                        else "waitlist"
+                    ),
+                )
                 result = _attempt(
                     db,
                     trip,
                     provider,
-                    candidate,
-                    (("waitlist", True),),
+                    refreshed_candidate,
+                    refreshed_kinds,
                     continuous=continuous,
                     wait=armed and not once,
                 )
