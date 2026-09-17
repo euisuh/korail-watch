@@ -191,18 +191,21 @@ def _execute(args: argparse.Namespace) -> str:
 
     from .engine import run
     from .korail import KorailProvider
+    from .diagnostics import configure as configure_diagnostics
 
     trip = load_trip(args.config)
     required = ["KORAIL_ID", "KORAIL_PASSWORD"]
     if args.command == "watch":
         required += ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
     load_credentials(*required)
+    state_dir = _state_dir(args.state_dir)
+    configure_diagnostics(state_dir)
     provider = KorailProvider(interval=provider_interval(args.config))
     provider.login()
     _warn_unsupported(trip, provider)
     if args.command == "check":
         print("Read-only check started; scanning the full configured window at the safe request rate.", flush=True)
-        return run(trip, provider, None, _state_dir(args.state_dir), armed=False, once=True)
+        return run(trip, provider, None, state_dir, armed=False, once=True)
 
     from .notifier import TelegramNotifier
 
@@ -214,7 +217,7 @@ def _execute(args: argparse.Namespace) -> str:
         trip,
         provider,
         notifier,
-        _state_dir(args.state_dir),
+        state_dir,
         armed=True,
         continuous=args.continuous,
     )
