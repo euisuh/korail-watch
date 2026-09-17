@@ -5,7 +5,10 @@ end = "18:00"
 departures = ["서울", "용산", "수서"]
 arrivals = ["대전", "서대전"]
 adults = 1
+allow_waitlist = true
+# Unsupported by the pinned provider; true emits an official-app handoff warning.
+allow_standing = false
+allow_mixed = false
 
 [provider]
 interval = 5.0
-
