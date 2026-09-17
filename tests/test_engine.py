@@ -1146,6 +1146,28 @@ class EngineTests(unittest.TestCase):
         self.assertNotIn("payment deadline", notifier.messages[-1])
         self.assertNotIn("PRIVATE-SALE-REFERENCE", notifier.messages[-1])
 
+    def test_seated_intent_paid_overlap_never_sends_payment_deadline(self):
+        selected = train()
+
+        class Crash(Provider):
+            def reserve(self, selected, kind, adults):
+                raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            run(trip(), Crash([selected]), Notifier(), self.state, armed=True, once=True)
+
+        unpaid = Hold("H1", selected, "2099-09-24T13:00:00+09:00", 50_000)
+        paid = Hold("PRIVATE-SALE-REFERENCE", selected, None, 50_000, paid=True)
+        provider, notifier = Provider(), Notifier()
+        provider.remote, provider.paid = [unpaid], [paid]
+        self.assertEqual(
+            run(trip(), provider, notifier, self.state, armed=True, once=True),
+            "existing-hold",
+        )
+        self.assertIn("payment is confirmed", notifier.messages[-1])
+        self.assertNotIn("payment deadline", notifier.messages[-1])
+        self.assertNotIn("PRIVATE-SALE-REFERENCE", notifier.messages[-1])
+
     def test_continuous_waitlist_rejects_another_unpaid_account_record(self):
         candidate = train(general=False, special=False, waitlist=True)
         requested = trip(allow_waitlist=True)

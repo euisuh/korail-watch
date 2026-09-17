@@ -811,8 +811,8 @@ def _reconcile(
                     ),
                     None,
                 )
-                if continuous and not exact.paid and paid_exact:
-                    _confirm_paid_overlap(db, exact, paid_exact)
+                if not exact.paid and paid_exact:
+                    _confirm_paid_overlap(db, exact, paid_exact, continuous=continuous)
                 else:
                     _confirm(db, exact)
                 return "existing-ticket" if exact.paid else "existing-hold"
