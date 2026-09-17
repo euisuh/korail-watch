@@ -211,8 +211,10 @@ esac
 
             subprocess.run(["sh", script, "install", config, "--continuous"], env=env, check=True, capture_output=True)
             with plist.open("rb") as handle:
-                continuous = plistlib.load(handle)["ProgramArguments"]
-            self.assertEqual("--continuous", continuous[-1])
+                installed = plistlib.load(handle)
+            self.assertEqual("--continuous", installed["ProgramArguments"][-1])
+            self.assertFalse(installed["KeepAlive"])
+            self.assertEqual(0o600, stat.S_IMODE(plist.stat().st_mode))
 
             subprocess.run(["sh", script, "install", config], env=env, check=True, capture_output=True)
             with plist.open("rb") as handle:
@@ -263,6 +265,7 @@ esac
     def test_launchd_propagates_inspection_unload_and_still_loaded_failures(self):
         cases = (
             ({"PRINT_ERROR_STATUS": "1"}, 1, "inspection failed"),
+            ({"PRINT_ERROR_STATUS": "113"}, 113, "inspection failed"),
             ({"BOOTOUT_ERROR_STATUS": "7"}, 7, "bootout failed"),
             ({"KEEP_LOADED": "1"}, 1, "still loaded"),
         )

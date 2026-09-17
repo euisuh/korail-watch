@@ -16,7 +16,7 @@ case "${1:-}" in
   *) usage ;;
 esac
 
-uid=${UID:-$(id -u)}
+uid=$(id -u)
 case "$uid" in
   ""|*[!0-9]*) echo "Could not determine the current user ID" >&2; exit 1 ;;
 esac

@@ -26,21 +26,26 @@ source .venv/bin/activate
 korail-watch configure
 ```
 
+Before any network check or armed run, edit `trip.toml` for your own future
+travel date, exact allowed stations, and time window. The watcher supports one
+adult per booking; example dates and routes are illustrative, not defaults for
+every user.
+
 `configure` prompts without echo and writes credentials with mode `0600` to
 `~/Library/Application Support/korail-watch/credentials.toml`. Credentials are
 never accepted as command-line arguments. Do not copy that file into the
 repository or share it in logs, issues, or screenshots. Telegram values may be
 left blank for `check`, but both are required for `notify-test` and armed use.
 
-The committed example is intentionally nonsecret:
+The configuration shape is intentionally nonsecret:
 
 ```toml
 [trip]
-date = "2026-09-24"
-start = "12:00"
-end = "18:00"
-departures = ["서울", "용산", "수서"]
-arrivals = ["대전", "서대전"]
+date = "2099-12-31" # replace with your future travel date
+start = "09:00"
+end = "12:00"
+departures = ["서울"]
+arrivals = ["대전"]
 adults = 1
 allow_waitlist = true
 allow_standing = true
@@ -51,9 +56,9 @@ allow_mixed = false
 interval = 5.0
 ```
 
-Do not substitute another station silently. In particular, 광명 and 수원 are
-not part of this trip. If the unofficial API cannot expose 수서 service, those
-exact searches return no trains; the watcher never substitutes another station.
+Departure and arrival lists are exact allowlists. If the unofficial API cannot
+expose a configured service, that search returns no trains; the watcher never
+silently substitutes another station.
 
 The pinned provider supports general and special seats plus waitlist and
 standing-only. Standing+seat is an accepted preference, but its full-route
@@ -76,10 +81,11 @@ korail-watch check --config trip.toml
 korail-watch notify-test
 ```
 
-`check` covers 42 route/hour targets at no less than five seconds between
-requests, plus login and reconciliation, so a complete run takes several
-minutes. Its final line is the termination outcome; `not-found` means the full
-configured window was checked, not that the command hung.
+`check` covers every configured station pair and hourly search window at no less
+than five seconds between requests, plus login and reconciliation. Target count
+and runtime therefore depend on your configuration. Its final line is the
+termination outcome; `not-found` means the full configured window was checked,
+not that the command hung.
 
 No live reservation is attempted until `--arm` is present. The default remains
 single-result mode and stops after the first hold or ticket; a waitlist is
@@ -113,11 +119,11 @@ Malformed, conflicting, duplicate, truncated, or incomplete paid records still
 stop safely for review.
 
 The one-unpaid limit is enforced from refreshed account snapshots, not a
-server-wide lock against simultaneous actions in the official app. Avoid creating
-other reservations manually while the watcher is armed; paying the current hold
-is supported. Unexpected additional unpaid records, authentication blocks, or
-unknown state stop the watcher for manual review. Continuous mode never turns
-these safety stops into blind restarts.
+server-wide lock against simultaneous actions in the official app. Pause the
+watcher before creating reservations manually or changing trips; paying the
+currently monitored hold is supported. Unexpected additional unpaid records,
+authentication blocks, or unknown state stop the watcher for manual review.
+Continuous mode never turns these safety stops into blind restarts.
 
 The armed command logs in, sends a Telegram preflight message, and then starts
 watching. `caffeinate -i` prevents idle system sleep while the terminal process
@@ -134,13 +140,36 @@ third argument for legacy single-result behavior, or install continuous mode
 explicitly:
 
 ```sh
+# Choose one installation mode:
 ./scripts/launchd.sh install "$PWD/trip.toml"
+# or:
 ./scripts/launchd.sh install "$PWD/trip.toml" --continuous
+```
+
+Manage that saved installation later:
+
+```sh
+./scripts/launchd.sh pause
+korail-watch status
+./scripts/launchd.sh resume
 ./scripts/launchd.sh uninstall
 ```
 
-`uninstall` stops the launchd watcher and removes its generated plist. Inspect
-`korail-watch status` before starting again; never launch a second process.
+`pause` persistently disables the installed per-user service before unloading it,
+so it remains disabled across logins and reboots. It keeps the saved plist,
+configuration, credentials, durable state, logs, and archives. It cannot stop a
+separate foreground watcher; press Ctrl-C in that process. Repeating `pause`
+when the service is already unloaded is safe.
+
+`resume` requires the saved installation, enables it, and requests startup with
+the same configuration path and single-result or continuous mode. Before
+resuming, inspect `korail-watch status` and the official app, and confirm no
+foreground watcher is running; never launch a second process. It does not kill
+or replay an already active attempt, and a startup request is not a guarantee of
+a healthy run. Keep the Mac awake and online, then inspect status and the private
+log again. After changing `trip.toml`, run `install` again instead of `resume` so
+the read-only preflight runs before the service is enabled. `uninstall` stops the
+launchd watcher and removes only its generated plist.
 
 Inspect durable local state at any time:
 
@@ -188,12 +217,13 @@ State is stored under
 `~/Library/Application Support/korail-watch/state`. A crash or uncertain
 reservation response leaves an unresolved intent and stops new reservations.
 Run `korail-watch status`, then inspect reservations and tickets in the official
-Korail app before taking further action. Do not delete state merely to restart:
-an ambiguous request may already have created a hold. A notification failure is
-also not permission to reserve again. Transient Telegram failures retry with
-bounded backoff while booking remains frozen. A non-retryable Telegram error
-stops the process but preserves both the hold and pending notification for
-operator recovery.
+Korail app before taking further action. An empty app view alone is not proof
+that an uncertain write failed. Pause before manual booking or changing the trip,
+and keep the old state: do not delete the database or select a fresh state
+directory to bypass a guard. A notification failure is also not permission to
+reserve again. Transient Telegram failures retry with bounded backoff while
+booking remains frozen. A non-retryable Telegram error stops the process but
+preserves both the hold and pending notification for operator recovery.
 
 Legacy state remains compatible: a stored hold without a `kind` is treated as a
 seated hold. Continuous mode does not use expiry to resolve an ambiguous write or
@@ -217,6 +247,11 @@ readback inside a reservation attempt, and it never clears an ambiguous durable
 intent. Renewal events use the same sanitized private diagnostics fields
 described above.
 
+That routine read-session renewal is distinct from an authentication or security
+block, malformed account state, or unresolved reservation write. Those conditions
+still require review. Pausing and resuming neither repairs them nor clears their
+durable guards; a resumed process may safely stop again for the same reason.
+
 Safe automatic recovery at the mutation boundary is deliberately narrow: only an
 initial connection-establishment timeout can be classified as not dispatched,
 with redirects disabled and the transport's default retries set to zero. Generic
@@ -227,11 +262,11 @@ is not proof that Korail rejected the request.
 The watcher uses one authenticated session, at least five seconds between
 requests, bounded retry behavior, and no parallel accounts, proxies, queue
 bypass, or automatic retries of uncertain reservation writes. It cannot
-guarantee availability, outcompete other users, or promise uninterrupted API
-access. Offline tests pass no credentials and contact neither Korail nor
-Telegram. Credentialed login, a read-only full-window search, and Telegram were
-verified on 2026-09-17. Waitlist mutation/allocation and standing or mixed
-booking have not been live-tested.
+book transfers, guarantee availability, outcompete other users, or promise
+uninterrupted operation or API access. Offline tests pass no credentials and
+contact neither Korail nor Telegram. Credentialed login, a read-only full-window
+search, and Telegram were verified on 2026-09-17. Waitlist mutation/allocation
+and standing or mixed booking have not been live-tested.
 
 ## Development
 
