@@ -559,6 +559,38 @@ class EngineTests(unittest.TestCase):
                 )
                 self.assertEqual(provider.reserve_calls[0][1], capability)
 
+    def test_standing_attempt_accepts_exact_seated_fulfillment_and_reconciliation(self):
+        selected = train(general=False, special=False, standing=True)
+        seated = Hold("S1", selected, None, None, kind="seated")
+
+        class SeatedInstead(Provider):
+            supported_modes = frozenset(("standing",))
+
+            def reserve(self, selected, kind, adults):
+                self.reserve_calls.append((selected, kind, adults))
+                return seated
+
+        requested = trip(allow_standing=True)
+        provider = SeatedInstead([selected])
+        self.assertEqual(run(requested, provider, Notifier(), self.state, armed=True, once=True), "reserved")
+        self.assertEqual(status(self.state)["hold"]["kind"], "seated")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+
+            class Crash(SeatedInstead):
+                def reserve(self, selected, kind, adults):
+                    raise KeyboardInterrupt
+
+            with self.assertRaises(KeyboardInterrupt):
+                run(requested, Crash([selected]), Notifier(), state, armed=True, once=True)
+            recovered = SeatedInstead()
+            recovered.remote = [seated]
+            self.assertEqual(
+                run(requested, recovered, Notifier(), state, armed=True, once=True),
+                "existing-hold",
+            )
+
     def test_ambiguous_reconciliation_is_durable_without_local_intent(self):
         class Uncertain(Provider):
             def reservations(self):

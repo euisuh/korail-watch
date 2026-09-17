@@ -235,8 +235,8 @@ class KorailProvider:
             raise AmbiguousReservation("Korail did not return the created reservation")
         try:
             hold = self._hold(reservation, paid=False)
-            expected = "standing" if seat_class == "standing" else "seated"
-            if hold.kind != expected:
+            accepted = {"standing", "seated"} if seat_class == "standing" else {"seated"}
+            if hold.kind not in accepted:
                 raise ValueError
             return hold
         except Exception as exc:

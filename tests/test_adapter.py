@@ -341,6 +341,12 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual({}, adapter._session.reservation_overrides)
         self.assertFalse(raw.has_general_seat())
 
+        # Inventory may reopen between search and 1101. One confirmed seat on
+        # the exact train is a stronger entitlement than the standing request.
+        client.reserve = lambda *args, **kwargs: RawReservation()
+        upgraded = adapter.reserve(train, "standing", 1)
+        self.assertEqual("seated", upgraded.kind)
+
         adapter._session.search_status[korail._raw_key(raw)] = ("13", "13")
         with self.assertRaises(SoldOut):
             adapter.reserve(adapter._train(raw), "standing", 1)

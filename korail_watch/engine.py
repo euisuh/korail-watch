@@ -360,7 +360,7 @@ def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
                     "waitlist-followup-unproven",
                 )
                 return "ambiguous"
-            if exact.kind == expected:
+            if exact.kind == expected or (requested == "standing" and exact.kind == "seated"):
                 _confirm(db, exact)
                 return "existing-ticket" if exact.paid else "existing-hold"
             _preserve_mismatch(db, exact)
@@ -414,7 +414,10 @@ def _attempt(
             result = _reconcile(db, trip, provider)
             return result or "ambiguous"
         expected = "seated" if kind in ("general", "special") else kind
-        if not isinstance(hold, Hold) or not _same_train(hold.train, train) or hold.kind != expected:
+        accepted_kind = isinstance(hold, Hold) and (
+            hold.kind == expected or (kind == "standing" and hold.kind == "seated")
+        )
+        if not isinstance(hold, Hold) or not _same_train(hold.train, train) or not accepted_kind:
             if isinstance(hold, Hold):
                 _preserve_mismatch(db, hold)
             return "ambiguous"
