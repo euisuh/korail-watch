@@ -200,6 +200,14 @@ may have been dispatched, uncertainty or incomplete follow-up still stops safely
 Diagnostics cannot reconstruct the cause of incidents that occurred before this
 logging existed.
 
+If a top-level search or complete account read returns the exact P058 expired-
+session code, the provider logs in again and retries that read once with the new
+client. A second P058 or rejected login remains a safety stop. Temporary login
+transport failures keep the existing read-only backoff behavior. Session renewal
+never replays a reservation submission, waitlist follow-up, or readback inside a
+reservation attempt, and it never clears an ambiguous durable intent. Renewal
+events use the same sanitized private diagnostics fields described above.
+
 Safe automatic recovery at the mutation boundary is deliberately narrow: only an
 initial connection-establishment timeout can be classified as not dispatched,
 with redirects disabled and the transport's default retries set to zero. Generic

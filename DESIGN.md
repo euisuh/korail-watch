@@ -89,6 +89,10 @@ issues, artifacts, or Git history.
 - `reservations() -> list[Hold]` and `tickets() -> list[Hold]` for reconciliation.
 - Separate per-instance requests Session with timeout, throttling and HTTP error
   translation. Internal SDK prints suppressed. Preserve security-block signals.
+- An exact P058 session-expiry response may renew login and retry a top-level
+  search, reservation-list, or complete ticket read once with the fresh client.
+  Never renew or replay a reservation submission, waitlist follow-up, or
+  mutation readback; repeated P058 or rejected login remains terminal.
 
 `korail_watch/notifier.py` (adapter owner):
 - `TelegramNotifier()` reads TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID from env.
@@ -114,6 +118,8 @@ issues, artifacts, or Git history.
   sold-out alternatives, stop at trip cutoff. Injection of sleep/clock accepted
   if useful for deterministic tests. Provider owns all network throttling.
 - Dry-run never calls reserve; --once performs bounded read-only coverage.
+- Session renewal stays inside the provider's top-level read boundary; the
+  engine adds no restart loop and never clears durable ambiguity state.
 - Deferred waitlist candidates are refreshed exactly before intent persistence.
   Stale candidates skip safely and transient read-only refresh failures back off;
   possible mutation dispatch or incomplete follow-up remains ambiguous.
