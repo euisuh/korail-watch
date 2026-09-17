@@ -19,9 +19,10 @@ The upstream fork supplies mobile API compatibility including DynaPath request
 headers; this is an unofficial API, not a Korail-supported integration. Do not
 invent additional evasion, proxy rotation, queue bypass, or parallel accounts.
 Stop on authentication/security blocks; back off on transient failures and 429.
-Live acceptance, including integrated 수서 services, requires a credentialed
-check and cannot be claimed from offline tests. If the API does not expose 수서,
-report unsupported/no results explicitly; never silently substitute 광명.
+Credentialed login and a read-only full-window search were verified on
+2026-09-17; no reservation mutation was used to test flexible modes. If the API
+does not expose 수서, report unsupported/no results explicitly; never silently
+substitute 광명.
 
 Reliability advantage comes from covering all six allowed station pairs and the
 whole time range, retaining the authenticated session, and acting immediately
@@ -75,6 +76,9 @@ issues, artifacts, or Git history.
   cursor; all train types, sold-out included, exact original train cached in raw.
 - `reserve(train, seat_class: str, adults: int) -> Hold`; classes include only
   evidence-backed general/special/waitlist/standing/mixed provider capabilities.
+- The supported extras are waitlist and narrow standing-only. Standing requires
+  the exact provider availability markers and authoritative one-passenger
+  standing readback. Mixed remains unsupported and warns with an app handoff.
 - `reservations() -> list[Hold]` and `tickets() -> list[Hold]` for reconciliation.
 - Separate per-instance requests Session with timeout, throttling and HTTP error
   translation. Internal SDK prints suppressed. Preserve security-block signals.
@@ -133,5 +137,6 @@ findings, merge once green. Root owns design, public repo, issues, coordination.
 - https://smart.letskorail.com/ebizmw/mwQna.do (waitlist allocation and payment
   guidance; provider deadlines remain authoritative).
 
-Live browser inspection showed an authenticated account and the current search
-UI, but no trains for the initial query. This is not a successful API check.
+Credentialed login, a read-only full-window API search, and Telegram delivery
+were verified on 2026-09-17. Waitlist mutation/allocation and standing or mixed
+booking remain unverified live; tests must not create speculative reservations.

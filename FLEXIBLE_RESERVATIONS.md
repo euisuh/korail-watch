@@ -35,12 +35,25 @@ isolated worktree is developed and reviewed.
 - Provider.reserve accepts existing `general`/`special`, plus supported
   `waitlist`/`standing`/`mixed`. Validate intent kind against returned kind.
 - Preserve actual provider status metadata from HTTP responses. `1102` is a
-  queue request; `1202` is reported as the first part of a mixed reservation,
-  therefore do not treat its first response as a whole-trip confirmed hold.
+  queue request. `1202` may return a default mixed allocation on one PNR with
+  two journeys; changing its connection station is a separate replacement flow.
+  Confirm the default only when returned account records prove contiguous,
+  same-train coverage of the entire requested route for one adult. A response
+  code or partial leg alone is not proof of a whole-trip entitlement.
 - Capabilities must be evidence-based. Do not invent request flags or label
   unsupported modes as enabled. If a requested mode needs unsupported/multi-step
   API behavior, surface it clearly and provide the official app handoff while
   continuing supported booking modes. Do not add speculative partial bookings.
+- Standing-only is restricted to the app-evidenced general-code `13` and
+  standing-code `11` combination, job `1101`, and `txtStndFlg=Y`. Confirm the
+  returned whole-route reservation and one standing passenger; do not label a
+  seated or partial response as standing. Mixed remains unsupported.
+- `supported_modes` lists additional capabilities; general and special seated
+  booking remain the baseline. Unsupported requests never create an intent.
+- Waitlist creation includes the required options follow-up on the same PNR.
+  If a crash or uncertain follow-up leaves an intent, history code `8` alone
+  cannot prove completion: retain ambiguity for manual recovery rather than
+  replaying either mutation. A persisted completed queue can be monitored.
 
 ## Ownership and verification
 

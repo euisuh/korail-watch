@@ -83,20 +83,20 @@ class CliTests(unittest.TestCase):
             (),
             {"allow_waitlist": True, "allow_standing": True, "allow_mixed": True},
         )()
-        provider = type("Provider", (), {"supported_modes": frozenset({"waitlist"})})()
+        provider = type("Provider", (), {"supported_modes": frozenset({"waitlist", "standing"})})()
         output = StringIO()
         with redirect_stderr(output):
             cli._warn_unsupported(trip, provider)
         warning = output.getvalue()
         self.assertNotIn("waitlist was requested", warning)
-        self.assertIn("standing-only was requested but is unsupported", warning)
+        self.assertNotIn("standing-only was requested", warning)
         self.assertIn("standing+seat was requested but is unsupported", warning)
         self.assertIn("official Korail app", warning)
 
-    def test_example_enables_only_verified_waitlist(self):
+    def test_example_enables_only_verified_flexible_modes(self):
         trip = cli.load_trip(Path(__file__).parents[1] / "trip.example.toml")
         self.assertTrue(trip.allow_waitlist)
-        self.assertFalse(trip.allow_standing)
+        self.assertTrue(trip.allow_standing)
         self.assertFalse(trip.allow_mixed)
 
     def test_demo_does_not_touch_default_state(self):

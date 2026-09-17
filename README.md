@@ -43,8 +43,8 @@ departures = ["서울", "용산", "수서"]
 arrivals = ["대전", "서대전"]
 adults = 1
 allow_waitlist = true
+allow_standing = true
 # Unsupported by the pinned provider; true emits an official-app handoff warning.
-allow_standing = false
 allow_mixed = false
 
 [provider]
@@ -55,11 +55,14 @@ Do not substitute another station silently. In particular, 광명 and 수원 are
 not part of this trip. If the unofficial API cannot expose 수서 service, those
 exact searches return no trains; the watcher never substitutes another station.
 
-The pinned provider currently verifies `waitlist` only. Standing-only and
-standing+seat are accepted preferences but their multi-step mobile flows are not
-implemented safely; requesting them prints an explicit warning and directs you
-to the official Korail app while seated and waitlist modes continue. No request
-flag or partial booking is invented for an unsupported mode.
+The pinned provider supports general and special seats plus waitlist and
+standing-only. Standing+seat is an accepted preference, but its full-route
+multi-stage handling is not yet verified; requesting it prints an explicit
+warning and directs you to the official Korail app while supported modes
+continue. No request flag or partial booking is invented for an unsupported mode.
+Standing-only is attempted only for the provider's exact standing availability
+markers, and account readback must confirm one standing passenger. Its request
+path is offline-tested but has not produced a live reservation in this release.
 
 ## Use
 
@@ -138,7 +141,9 @@ requests, bounded retry behavior, and no parallel accounts, proxies, queue
 bypass, or automatic retries of uncertain reservation writes. It cannot
 guarantee availability, outcompete other users, or promise uninterrupted API
 access. Offline tests pass no credentials and contact neither Korail nor
-Telegram. Credentialed live acceptance has not yet been verified.
+Telegram. Credentialed login, a read-only full-window search, and Telegram were
+verified on 2026-09-17. Waitlist mutation/allocation and standing or mixed
+booking have not been live-tested.
 
 ## Development
 
