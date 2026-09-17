@@ -79,6 +79,29 @@ def _same_train(left: Train, right: Train) -> bool:
     return all(getattr(left, field) == getattr(right, field) for field in fields)
 
 
+def _canonical_service(train: Train) -> tuple[str, str, str] | None:
+    parts = train.key.split("|")
+    if len(parts) != 7 or not all(parts):
+        return None
+    date_value, train_class, train_number, departure, dep_time, arrival, arr_time = parts
+    if not (
+        train_class.isascii()
+        and train_class.isdecimal()
+        and train_number.isascii()
+        and train_number.isdecimal()
+    ):
+        return None
+    if (date_value, departure, dep_time, arrival, arr_time) != (
+        train.date,
+        train.departure,
+        train.dep_time,
+        train.arrival,
+        train.arr_time,
+    ):
+        return None
+    return date_value, train_class, train_number
+
+
 def _matches_trip(trip: Trip, train: Train) -> bool:
     """Match persisted account records without discarding departed trains."""
     return (
@@ -440,10 +463,18 @@ def _record_paid(
 
 
 def _paid_train(db: sqlite3.Connection, train: Train) -> bool:
-    return any(
-        _same_train(_hold_from_data(item).train, train)
-        for item in (_get(db, "paid_tickets") or [])
-    )
+    service = _canonical_service(train)
+    for item in _get(db, "paid_tickets") or []:
+        paid = _hold_from_data(item).train
+        if _same_train(paid, train):
+            return True
+        if service is None or _canonical_service(paid) != service:
+            continue
+        if train.arr_time <= train.dep_time or paid.arr_time <= paid.dep_time:
+            return True
+        if train.dep_time < paid.arr_time and paid.dep_time < train.arr_time:
+            return True
+    return False
 
 
 def _preserve_account_unknown(db: sqlite3.Connection, reason: str, remote: list[Hold]) -> None:
@@ -486,7 +517,7 @@ def _reconcile_continuous(db: sqlite3.Connection, trip: Trip, provider) -> str |
         _preserve_account_unknown(db, "account-read-unknown", [])
         return "ambiguous"
 
-    paid = [hold for hold in remote if hold.paid and _matches_trip(trip, hold.train)]
+    paid = [hold for hold in remote if hold.paid and hold.train.date == trip.date]
     try:
         _record_paid(db, paid)
     except Exception:
@@ -565,7 +596,7 @@ def _monitor_hold(
             _drain_queue_outbox(db, notifier)
             return "ambiguous"
 
-        paid = [item for item in remote if item.paid and _matches_trip(trip, item.train)]
+        paid = [item for item in remote if item.paid and item.train.date == trip.date]
         try:
             _record_paid(db, paid)
         except Exception:
@@ -700,7 +731,7 @@ def _monitor_queue(
             return "ambiguous"
 
         original = _hold_from_data(queued)
-        paid = [hold for hold in remote if hold.paid and _matches_trip(trip, hold.train)]
+        paid = [hold for hold in remote if hold.paid and hold.train.date == trip.date]
         try:
             _record_paid(db, paid)
         except Exception:

@@ -151,7 +151,7 @@ def provider(client=None):
 def paid_tickets(adapter, *raw_tickets):
     def read():
         adapter._session.ticket_status = {
-            item.get_ticket_no(): ("paid-pnr", korail._raw_key(item)) for item in raw_tickets
+            (item.get_ticket_no(), korail._raw_key(item)): "paid-pnr" for item in raw_tickets
         }
         adapter._session.ticket_complete = True
         return list(raw_tickets)
@@ -192,10 +192,12 @@ def ticket_row(**changes):
     return row
 
 
-def ticket_list_payload(row):
+def ticket_list_payload(*rows):
     return {
         "strResult": "SUCC",
-        "reservation_list": [{"ticket_list": [{"train_info": [row]}]}],
+        "reservation_list": [
+            {"ticket_list": [{"train_info": [row]}]} for row in rows
+        ],
     }
 
 
@@ -233,7 +235,7 @@ class ProviderTests(unittest.TestCase):
                 calls = {"old": 0, "fresh": 0, "login": 0}
                 adapter._session.search_status = {"stale": ("11", "11")}
                 adapter._session.reservation_status = {"stale": ("3", 1, 0)}
-                adapter._session.ticket_status = {"stale": ("pnr", "train")}
+                adapter._session.ticket_status = {("stale", "train"): "pnr"}
                 adapter._session.ticket_complete = True
 
                 def expired(*args, **kwargs):
@@ -273,7 +275,7 @@ class ProviderTests(unittest.TestCase):
                         self.assertFalse(adapter._session.ticket_complete)
                         raw = RawTicket()
                         adapter._session.ticket_status = {
-                            raw.get_ticket_no(): ("paid-pnr", korail._raw_key(raw))
+                            (raw.get_ticket_no(), korail._raw_key(raw)): "paid-pnr"
                         }
                         adapter._session.ticket_complete = True
                         return [raw]
@@ -1071,10 +1073,18 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(AmbiguousReservation):
             adapter.tickets()
 
-    def test_pinned_sdk_paid_list_preserves_full_route_and_four_part_reference(self):
+    def test_pinned_sdk_paid_segments_share_reference_and_preserve_each_route(self):
         import korail2
 
-        row = ticket_row()
+        first = ticket_row()
+        second = ticket_row(
+            h_dpt_rs_stn_nm="대전",
+            h_dpt_rs_stn_cd="0010",
+            h_dpt_tm="131000",
+            h_arv_rs_stn_nm="부산",
+            h_arv_rs_stn_cd="0020",
+            h_arv_tm="150000",
+        )
         calls = []
 
         def response(payload, url):
@@ -1090,7 +1100,7 @@ class ProviderTests(unittest.TestCase):
             if url.endswith(".myTicket.MyTicketList"):
                 self.assertEqual("1", kwargs["params"]["txtIndex"])
                 self.assertEqual("1", kwargs["params"]["h_page_no"])
-                return response(ticket_list_payload(row), url)
+                return response(ticket_list_payload(first, second), url)
             if url.endswith(".refunds.SelTicketInfo"):
                 return response(
                     {
@@ -1113,11 +1123,46 @@ class ProviderTests(unittest.TestCase):
         ):
             holds = adapter.tickets()
 
-        self.assertEqual(2, len(calls))
-        self.assertEqual("001-20260917-000001-99999", holds[0].reference)
-        self.assertEqual("2026-09-24|100|001|서울|12:00|대전|13:00", holds[0].train.key)
-        self.assertTrue(holds[0].paid)
-        self.assertEqual("seated", holds[0].kind)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(2, len(holds))
+        self.assertEqual(
+            ["001-20260917-000001-99999"] * 2,
+            [hold.reference for hold in holds],
+        )
+        self.assertEqual(
+            [
+                "2026-09-24|100|001|서울|12:00|대전|13:00",
+                "2026-09-24|100|001|대전|13:10|부산|15:00",
+            ],
+            [hold.train.key for hold in holds],
+        )
+        self.assertTrue(all(hold.paid for hold in holds))
+        self.assertTrue(all(hold.kind == "seated" for hold in holds))
+        self.assertEqual(2, len(adapter._session.ticket_status))
+
+    def test_paid_sdk_results_must_cover_each_captured_composite_once(self):
+        class SecondLeg(RawTicket):
+            dep_name = "대전"
+            dep_code = "0010"
+            dep_time = "131000"
+            arr_name = "부산"
+            arr_code = "0020"
+            arr_time = "150000"
+
+        first, second = RawTicket(), SecondLeg()
+        adapter = provider()
+
+        def incomplete():
+            adapter._session.ticket_status = {
+                (first.get_ticket_no(), korail._raw_key(first)): "paid-pnr",
+                (second.get_ticket_no(), korail._raw_key(second)): "paid-pnr",
+            }
+            adapter._session.ticket_complete = True
+            return [first, first]
+
+        adapter._client.tickets = incomplete
+        with self.assertRaises(AmbiguousReservation):
+            adapter.tickets()
 
     def test_ticket_detail_expiry_relogs_and_restarts_the_complete_list(self):
         import korail2
@@ -1263,10 +1308,26 @@ class ProviderTests(unittest.TestCase):
         cases["multi-leg"]["reservation_list"][0]["ticket_list"][0]["train_info"].append(
             ticket_row(h_trn_no="002")
         )
-        cases["duplicate-reference"] = copy.deepcopy(base)
-        cases["duplicate-reference"]["reservation_list"].append(
-            copy.deepcopy(cases["duplicate-reference"]["reservation_list"][0])
+        cases["duplicate-composite"] = copy.deepcopy(base)
+        cases["duplicate-composite"]["reservation_list"].append(
+            copy.deepcopy(cases["duplicate-composite"]["reservation_list"][0])
         )
+        cases["conflicting-pnr"] = ticket_list_payload(
+            ticket_row(),
+            ticket_row(
+                h_pnr_no="paid-pnr-2",
+                h_dpt_rs_stn_nm="대전",
+                h_dpt_rs_stn_cd="0010",
+                h_dpt_tm="131000",
+                h_arv_rs_stn_nm="부산",
+                h_arv_rs_stn_cd="0020",
+                h_arv_tm="150000",
+            ),
+        )
+        cases["missing-journey-field"] = copy.deepcopy(base)
+        del cases["missing-journey-field"]["reservation_list"][0]["ticket_list"][0][
+            "train_info"
+        ][0]["h_arv_tm"]
 
         for name, payload in cases.items():
             with self.subTest(case=name):
