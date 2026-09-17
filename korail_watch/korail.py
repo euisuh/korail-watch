@@ -278,23 +278,26 @@ class KorailProvider:
         self._client = client
 
     def search(self, trip, departure: str, arrival: str, after: str) -> list[Train]:
-        client, sdk = self._ready()
-        try:
-            raw_trains = client.search_train(
-                departure,
-                arrival,
-                trip.date.replace("-", ""),
-                after.replace(":", ""),
-                sdk.TrainType.ALL,
-                [sdk.AdultPassenger(trip.adults)],
-                include_no_seats=True,
-            )
-        except Exception as exc:
-            if isinstance(exc, sdk.NoResultsError):
-                return []
-            self._raise(exc, operation="search")
-        try:
+        def read(client, sdk):
+            self._session.search_status = {}
+            try:
+                raw_trains = client.search_train(
+                    departure,
+                    arrival,
+                    trip.date.replace("-", ""),
+                    after.replace(":", ""),
+                    sdk.TrainType.ALL,
+                    [sdk.AdultPassenger(trip.adults)],
+                    include_no_seats=True,
+                )
+            except Exception as exc:
+                if isinstance(exc, sdk.NoResultsError):
+                    return []
+                raise
             return [self._train(train) for train in raw_trains]
+
+        try:
+            return self._read("search", read)
         except Exception as exc:
             self._raise(exc, operation="search")
 
@@ -384,17 +387,19 @@ class KorailProvider:
                 raise AmbiguousReservation("Korail reservation outcome is unknown") from None
 
     def reservations(self) -> list[Hold]:
-        client, _ = self._ready()
-        try:
+        def read(client, _sdk):
+            self._session.reservation_status = {}
             return [self._hold(item, paid=False) for item in client.reservations()]
+
+        try:
+            return self._read("reservations", read)
         except Exception as exc:
             self._raise(exc, operation="reservations")
 
     def tickets(self) -> list[Hold]:
-        client, _ = self._ready()
-        self._session.ticket_status = {}
-        self._session.ticket_complete = False
-        try:
+        def read(client, _sdk):
+            self._session.ticket_status = {}
+            self._session.ticket_complete = False
             try:
                 raw_tickets = client.tickets()
             except Exception:
@@ -407,8 +412,69 @@ class KorailProvider:
             if len(holds) != len(self._session.ticket_status):
                 raise AmbiguousReservation("Korail ticket list is incomplete")
             return holds
+
+        try:
+            return self._read("tickets", read)
         except Exception as exc:
             self._raise(exc, operation="tickets")
+
+    def _read(self, operation: str, read):
+        renewed = False
+        while True:
+            client, sdk = self._ready()
+            try:
+                return read(client, sdk)
+            except Exception as exc:
+                if renewed or not self._expired_read_session(exc, sdk):
+                    raise
+                renewed = True
+                self._renew_read_session(operation, exc)
+
+    def _expired_read_session(self, exc: Exception, sdk) -> bool:
+        return bool(
+            not self._session.reservation_active
+            and isinstance(exc, sdk.NeedToLoginError)
+            and getattr(exc, "code", None) == "P058"
+        )
+
+    def _renew_read_session(self, operation: str, expired: Exception) -> None:
+        stage = (
+            self._session.last_stage
+            if self._session.last_operation == operation
+            else "request"
+        )
+        diagnostics.event(
+            "session.renewal",
+            operation=operation,
+            stage=stage,
+            outcome="starting",
+            provider_code="P058",
+            error_type=_safe_error_type(type(expired).__name__),
+        )
+        try:
+            self.login()
+        except Exception as exc:
+            outcome = (
+                "transient"
+                if isinstance(exc, TransientError)
+                else "blocked" if isinstance(exc, BlockedError) else "error"
+            )
+            diagnostics.event(
+                "session.renewal",
+                operation=operation,
+                stage=stage,
+                outcome=outcome,
+                provider_code="P058",
+                error_type=_safe_error_type(type(exc).__name__),
+            )
+            raise
+        diagnostics.event(
+            "session.renewal",
+            operation=operation,
+            stage=stage,
+            outcome="success",
+            provider_code="P058",
+        )
 
     def _ready(self):
         if self._client is None or self._sdk is None:

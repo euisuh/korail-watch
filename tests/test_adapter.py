@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -30,7 +31,9 @@ class _SoldOut(Exception):
 
 
 class _NeedLogin(Exception):
-    pass
+    def __init__(self, code="P058", message="session expired"):
+        super().__init__(message)
+        self.code = code
 
 
 class _KorailError(Exception):
@@ -218,6 +221,208 @@ class ProviderTests(unittest.TestCase):
         self.assertFalse(trains[0].waitlist)
         self.assertFalse(trains[0].standing)
         self.assertIsInstance(trains[0].raw, RawTrain)
+
+    def test_top_level_reads_renew_once_with_fresh_client_and_clean_snapshots(self):
+        trip = Trip("2026-09-24", "12:00", "18:00", ("서울",), ("대전",))
+
+        for operation in ("search", "reservations", "tickets"):
+            with self.subTest(operation=operation):
+                old = FakeClient()
+                fresh = FakeClient()
+                adapter = provider(old)
+                calls = {"old": 0, "fresh": 0, "login": 0}
+                adapter._session.search_status = {"stale": ("11", "11")}
+                adapter._session.reservation_status = {"stale": ("3", 1, 0)}
+                adapter._session.ticket_status = {"stale": ("pnr", "train")}
+                adapter._session.ticket_complete = True
+
+                def expired(*args, **kwargs):
+                    calls["old"] += 1
+                    raise _NeedLogin(message="password=secret private-pnr")
+
+                def renew():
+                    calls["login"] += 1
+                    adapter._client = fresh
+
+                if operation == "search":
+                    old.search_train = expired
+
+                    def succeeded(*args, **kwargs):
+                        calls["fresh"] += 1
+                        self.assertEqual({}, adapter._session.search_status)
+                        return [RawTrain()]
+
+                    fresh.search_train = succeeded
+                    invoke = lambda: adapter.search(trip, "서울", "대전", "12:00:00")
+                elif operation == "reservations":
+                    old.reservations = expired
+
+                    def succeeded():
+                        calls["fresh"] += 1
+                        self.assertEqual({}, adapter._session.reservation_status)
+                        return [RawReservation()]
+
+                    fresh.reservations = succeeded
+                    invoke = adapter.reservations
+                else:
+                    old.tickets = expired
+
+                    def succeeded():
+                        calls["fresh"] += 1
+                        self.assertEqual({}, adapter._session.ticket_status)
+                        self.assertFalse(adapter._session.ticket_complete)
+                        raw = RawTicket()
+                        adapter._session.ticket_status = {
+                            raw.get_ticket_no(): ("paid-pnr", korail._raw_key(raw))
+                        }
+                        adapter._session.ticket_complete = True
+                        return [raw]
+
+                    fresh.tickets = succeeded
+                    invoke = adapter.tickets
+
+                with patch.object(adapter, "login", side_effect=renew), patch.object(
+                    korail.diagnostics, "event"
+                ) as event:
+                    result = invoke()
+
+                self.assertEqual(1, len(result))
+                self.assertEqual({"old": 1, "fresh": 1, "login": 1}, calls)
+                renewal = [call for call in event.call_args_list if call.args == ("session.renewal",)]
+                self.assertEqual(["starting", "success"], [call.kwargs["outcome"] for call in renewal])
+                self.assertTrue(all(call.kwargs["provider_code"] == "P058" for call in renewal))
+                self.assertNotIn("secret", repr(renewal))
+                self.assertNotIn("private-pnr", repr(renewal))
+
+    def test_read_renewal_exact_code_one_retry_and_failed_login(self):
+        trip = Trip("2026-09-24", "12:00", "18:00", ("서울",), ("대전",))
+
+        adapter = provider()
+        adapter._client.search_train = lambda *args, **kwargs: (_ for _ in ()).throw(
+            _NeedLogin("P059")
+        )
+        with patch.object(adapter, "login") as login, self.assertRaises(BlockedError):
+            adapter.search(trip, "서울", "대전", "12:00:00")
+        login.assert_not_called()
+
+        old, fresh = FakeClient(), FakeClient()
+        old.search_train = lambda *args, **kwargs: (_ for _ in ()).throw(_NeedLogin())
+        fresh.search_train = lambda *args, **kwargs: (_ for _ in ()).throw(_NeedLogin())
+        adapter = provider(old)
+
+        def renew():
+            adapter._client = fresh
+
+        with patch.object(adapter, "login", side_effect=renew) as login, self.assertRaises(
+            BlockedError
+        ):
+            adapter.search(trip, "서울", "대전", "12:00:00")
+        login.assert_called_once_with()
+
+        for failure in (TransientError(retry_after=17), BlockedError("rejected")):
+            with self.subTest(login_failure=type(failure).__name__):
+                adapter = provider()
+                read_calls = 0
+
+                def expired(*args, **kwargs):
+                    nonlocal read_calls
+                    read_calls += 1
+                    raise _NeedLogin()
+
+                adapter._client.search_train = expired
+                with patch.object(adapter, "login", side_effect=failure) as login, self.assertRaises(
+                    type(failure)
+                ) as raised:
+                    adapter.search(trip, "서울", "대전", "12:00:00")
+                login.assert_called_once_with()
+                self.assertEqual(1, read_calls)
+                if isinstance(failure, TransientError):
+                    self.assertEqual(17, raised.exception.retry_after)
+
+    def test_read_renewal_preserves_an_authoritative_empty_result(self):
+        trip = Trip("2026-09-24", "12:00", "18:00", ("서울",), ("대전",))
+        for operation in ("search", "reservations", "tickets"):
+            with self.subTest(operation=operation):
+                old, fresh = FakeClient(), FakeClient()
+                adapter = provider(old)
+
+                def expired(*args, **kwargs):
+                    raise _NeedLogin()
+
+                if operation == "search":
+                    old.search_train = expired
+                    fresh.search_train = lambda *args, **kwargs: (_ for _ in ()).throw(
+                        _NoResults()
+                    )
+                    invoke = lambda: adapter.search(trip, "서울", "대전", "12:00:00")
+                elif operation == "reservations":
+                    old.reservations = expired
+                    fresh.reservations = lambda: []
+                    invoke = adapter.reservations
+                else:
+                    old.tickets = expired
+
+                    def empty_tickets():
+                        adapter._session.ticket_status = {}
+                        adapter._session.ticket_complete = True
+                        return []
+
+                    fresh.tickets = empty_tickets
+                    invoke = adapter.tickets
+
+                def renew():
+                    adapter._client = fresh
+
+                with patch.object(adapter, "login", side_effect=renew):
+                    self.assertEqual([], invoke())
+
+    def test_session_expiry_never_renews_or_replays_reservation_work(self):
+        class WaitTrain(RawTrain):
+            wait_reserve_flag = 9
+
+        cases = ("initial", "readback", "followup", "waitlist_readback")
+        for stage in cases:
+            with self.subTest(stage=stage):
+                client = FakeClient()
+                adapter = provider(client)
+                reserve_calls = 0
+
+                def reserve(*args, **kwargs):
+                    nonlocal reserve_calls
+                    reserve_calls += 1
+                    if stage == "initial":
+                        raise _NeedLogin()
+                    if stage == "readback":
+                        client.reservations = lambda: (_ for _ in ()).throw(_NeedLogin())
+                        return adapter.reservations()[0]
+                    adapter._session.last_reservation_response = {
+                        "strResult": "SUCC",
+                        "h_msg_cd": "IRR000014",
+                        "h_pnr_no": "queue-1",
+                    }
+                    return None
+
+                client.reserve = reserve
+                waitlist = stage in ("followup", "waitlist_readback")
+                train = adapter._train(WaitTrain() if waitlist else RawTrain())
+                if stage == "followup":
+                    context = patch.object(adapter._session, "post", side_effect=_NeedLogin())
+                elif stage == "waitlist_readback":
+                    response = requests.Response()
+                    response.status_code = 200
+                    response._content = json.dumps(
+                        {"strResult": "SUCC", "h_msg_cd": "IRZ000003"}
+                    ).encode()
+                    client.reservations = lambda: (_ for _ in ()).throw(_NeedLogin())
+                    context = patch.object(adapter._session, "post", return_value=response)
+                else:
+                    context = contextlib.nullcontext()
+                with patch.object(adapter, "login") as login, context, self.assertRaises(
+                    BlockedError
+                ):
+                    adapter.reserve(train, "waitlist" if waitlist else "general", 1)
+                login.assert_not_called()
+                self.assertEqual(1, reserve_calls)
 
     def test_reserve_is_exact_class_never_waits_and_suppresses_sdk_print(self):
         client = FakeClient()
@@ -913,6 +1118,97 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual("2026-09-24|100|001|서울|12:00|대전|13:00", holds[0].train.key)
         self.assertTrue(holds[0].paid)
         self.assertEqual("seated", holds[0].kind)
+
+    def test_ticket_detail_expiry_relogs_and_restarts_the_complete_list(self):
+        import korail2
+
+        first = ticket_row(h_orgtk_sale_sqno="000001")
+        second = ticket_row(h_orgtk_sale_sqno="000002")
+        list_count = 0
+        detail_count = 0
+        list_keys = []
+
+        def response(payload, url):
+            result = requests.Response()
+            result.status_code = 200
+            result.url = url
+            result._content = json.dumps(payload).encode()
+            result.encoding = "utf-8"
+            return result
+
+        def request(_session, method, url, **kwargs):
+            nonlocal list_count, detail_count
+            if url.endswith(".common.code.do"):
+                return response(
+                    {
+                        "strResult": "SUCC",
+                        "app.login.cphd": {
+                            "idx": "1",
+                            "key": "0123456789abcdef0123456789abcdef",
+                        },
+                    },
+                    url,
+                )
+            if url.endswith(".myTicket.MyTicketList"):
+                list_count += 1
+                list_keys.append(kwargs["params"]["Key"])
+                row = first if list_count == 1 else second
+                return response(ticket_list_payload(row), url)
+            if url.endswith(".refunds.SelTicketInfo"):
+                detail_count += 1
+                if detail_count == 1:
+                    return response(
+                        {
+                            "strResult": "FAIL",
+                            "h_msg_cd": "P058",
+                            "h_msg_txt": "password=secret private-pnr",
+                        },
+                        url,
+                    )
+                return response(
+                    {
+                        "strResult": "SUCC",
+                        "ticket_infos": {
+                            "ticket_info": [{"tk_seat_info": [{"h_seat_no": "5A"}]}]
+                        },
+                    },
+                    url,
+                )
+            if url.endswith(".login.Login"):
+                return response(
+                    {
+                        "strResult": "SUCC",
+                        "strMbCrdNo": "member",
+                        "strCustNm": "name",
+                        "strEmailAdr": "mail@example.invalid",
+                        "Key": "new-session",
+                    },
+                    url,
+                )
+            raise AssertionError(f"unexpected offline request: {url}")
+
+        adapter = KorailProvider()
+        client = korail2.Korail("member", "password", auto_login=False, want_feedback=False)
+        client._key = "old-session"
+        client._session = adapter._session
+        adapter._sdk, adapter._client = korail2, client
+
+        with patch.dict(
+            os.environ, {"KORAIL_ID": "member", "KORAIL_PASSWORD": "password"}, clear=True
+        ), patch.object(requests.Session, "request", request), patch(
+            "korail_watch.korail.time.sleep"
+        ), patch.object(korail.diagnostics, "event") as event:
+            holds = adapter.tickets()
+
+        self.assertEqual(2, list_count)
+        self.assertEqual(2, detail_count)
+        self.assertEqual(["old-session", "new-session"], list_keys)
+        self.assertEqual("001-20260917-000002-99999", holds[0].reference)
+        self.assertEqual(1, len(adapter._session.ticket_status))
+        serialized = repr(event.call_args_list)
+        self.assertIn("session.renewal", serialized)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("private-pnr", serialized)
 
     def test_pinned_sdk_definitive_empty_ticket_responses_are_authoritative(self):
         import korail2
