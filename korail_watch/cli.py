@@ -119,8 +119,7 @@ def _parser() -> argparse.ArgumentParser:
     status_parser = commands.add_parser("status", help="show durable watcher state")
     status_parser.add_argument("--state-dir", type=Path, default=None)
     commands.add_parser("notify-test", help="send a Telegram test message")
-    demo_parser = commands.add_parser("demo", help="run the offline demonstration")
-    demo_parser.add_argument("--state-dir", type=Path, default=None)
+    commands.add_parser("demo", help="run the offline demonstration")
     return parser
 
 
@@ -140,7 +139,9 @@ def _execute(args: argparse.Namespace) -> str:
     if args.command == "demo":
         from .engine import demo
 
-        return demo(_state_dir(args.state_dir))
+        with tempfile.TemporaryDirectory(prefix="korail-watch-demo-") as directory:
+            result = demo(Path(directory))
+        return f"Offline demo: {result} (no live reservation)."
 
     if args.command == "notify-test":
         from .notifier import TelegramNotifier

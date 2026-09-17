@@ -2,6 +2,8 @@ import os
 import stat
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -49,6 +51,14 @@ class CliTests(unittest.TestCase):
             config.write_text("[provider]\ninterval = 4.9\n")
             with self.assertRaisesRegex(ValueError, "at least 5"):
                 cli.provider_interval(config)
+
+    def test_demo_does_not_touch_default_state(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(Path, "home", return_value=Path(home)):
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(0, cli.main(["demo"]))
+            self.assertEqual("Offline demo: reserved (no live reservation).\n", output.getvalue())
+            self.assertFalse(cli.default_state_dir().exists())
 
 
 if __name__ == "__main__":

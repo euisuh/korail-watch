@@ -73,6 +73,16 @@ finite foreground process is deliberate: do not configure launchd `KeepAlive`
 or an unconditional restart, because success and security blocks must remain
 stopped.
 
+After `check` and `notify-test` work, the included launchd helper can start the
+watcher at login. Installation repeats the read-only check before loading
+anything; it refuses blocked, ambiguous, or failed results. It uses
+`KeepAlive=false`, so a successful hold or security stop is not restarted.
+
+```sh
+./scripts/launchd.sh install "$PWD/trip.toml"
+./scripts/launchd.sh uninstall
+```
+
 Inspect durable local state at any time:
 
 ```sh
