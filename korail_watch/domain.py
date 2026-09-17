@@ -40,6 +40,9 @@ class Train:
     general: bool
     special: bool
     raw: object = field(default=None, repr=False, compare=False)
+    waitlist: bool = False
+    standing: bool = False
+    mixed: bool = False
 
     def __post_init__(self) -> None:
         if not all((self.key, self.departure, self.arrival)):
@@ -47,7 +50,7 @@ class Train:
         _date(self.date)
         _time(self.dep_time)
         _time(self.arr_time)
-        if type(self.general) is not bool or type(self.special) is not bool:
+        if any(type(value) is not bool for value in (self.general, self.special, self.waitlist, self.standing, self.mixed)):
             raise ValueError("seat availability must be boolean")
 
 
@@ -59,6 +62,9 @@ class Trip:
     departures: tuple[str, ...]
     arrivals: tuple[str, ...]
     adults: int = 1
+    allow_waitlist: bool = False
+    allow_standing: bool = False
+    allow_mixed: bool = False
 
     def __post_init__(self) -> None:
         _date(self.date)
@@ -77,6 +83,8 @@ class Trip:
             raise ValueError("departure and arrival stations must differ")
         if type(self.adults) is not int or self.adults != 1:
             raise ValueError("exactly one adult is supported")
+        if any(type(value) is not bool for value in (self.allow_waitlist, self.allow_standing, self.allow_mixed)):
+            raise ValueError("reservation capabilities must be boolean")
 
     def matches(self, train: Train, *, now: datetime | None = None) -> bool:
         if not isinstance(train, Train):
@@ -99,6 +107,7 @@ class Hold:
     deadline: str | None
     price: int | None
     paid: bool = False
+    kind: str = "seated"
 
     def __post_init__(self) -> None:
         if not self.reference:
@@ -116,6 +125,10 @@ class Hold:
             raise ValueError("price must be a non-negative integer")
         if type(self.paid) is not bool:
             raise ValueError("paid must be boolean")
+        if self.kind not in {"seated", "standing", "mixed", "waitlist"}:
+            raise ValueError("hold kind is invalid")
+        if self.kind == "waitlist" and self.deadline is not None:
+            raise ValueError("waitlist must not have a payment deadline")
 
 
 class SoldOut(Exception):

@@ -2,7 +2,7 @@ import os
 import stat
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +11,14 @@ from korail_watch import cli
 
 
 class CliTests(unittest.TestCase):
+    def _trip_config(self, directory: str, extra: str = "") -> Path:
+        path = Path(directory) / "trip.toml"
+        path.write_text(
+            '[trip]\ndate = "2099-09-24"\nstart = "12:00"\nend = "18:00"\n'
+            'departures = ["서울"]\narrivals = ["대전"]\nadults = 1\n' + extra
+        )
+        return path
+
     def test_configure_writes_private_credentials_outside_repository(self):
         values = iter(("member", "password", "token", "chat"))
         with tempfile.TemporaryDirectory() as home, patch.object(Path, "home", return_value=Path(home)), patch(
@@ -51,6 +59,45 @@ class CliTests(unittest.TestCase):
             config.write_text("[provider]\ninterval = 4.9\n")
             with self.assertRaisesRegex(ValueError, "at least 5"):
                 cli.provider_interval(config)
+
+    def test_trip_reservation_modes_default_off_and_load_booleans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = cli.load_trip(self._trip_config(directory))
+            self.assertFalse(legacy.allow_waitlist)
+            self.assertFalse(legacy.allow_standing)
+            self.assertFalse(legacy.allow_mixed)
+
+            configured = cli.load_trip(
+                self._trip_config(
+                    directory,
+                    "allow_waitlist = true\nallow_standing = true\nallow_mixed = true\n",
+                )
+            )
+            self.assertTrue(configured.allow_waitlist)
+            self.assertTrue(configured.allow_standing)
+            self.assertTrue(configured.allow_mixed)
+
+    def test_requested_unsupported_modes_warn_with_app_handoff(self):
+        trip = type(
+            "Trip",
+            (),
+            {"allow_waitlist": True, "allow_standing": True, "allow_mixed": True},
+        )()
+        provider = type("Provider", (), {"supported_modes": frozenset({"waitlist", "standing"})})()
+        output = StringIO()
+        with redirect_stderr(output):
+            cli._warn_unsupported(trip, provider)
+        warning = output.getvalue()
+        self.assertNotIn("waitlist was requested", warning)
+        self.assertNotIn("standing-only was requested", warning)
+        self.assertIn("standing+seat was requested but is unsupported", warning)
+        self.assertIn("official Korail app", warning)
+
+    def test_example_enables_only_verified_flexible_modes(self):
+        trip = cli.load_trip(Path(__file__).parents[1] / "trip.example.toml")
+        self.assertTrue(trip.allow_waitlist)
+        self.assertTrue(trip.allow_standing)
+        self.assertFalse(trip.allow_mixed)
 
     def test_demo_does_not_touch_default_state(self):
         with tempfile.TemporaryDirectory() as home, patch.object(Path, "home", return_value=Path(home)):

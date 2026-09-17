@@ -1,8 +1,9 @@
 # Korail Watch
 
 Korail Watch is a small macOS-first Python CLI that searches every configured
-station pair and holds the first eligible seated train for one adult. It never
-pays, cancels, books standing room, or creates more than one hold.
+station pair for one adult. It prefers an immediate travel entitlement and joins
+one waitlist only after a complete pass finds no immediate option. It never pays,
+cancels, or creates multiple bookings.
 
 This project uses Korail's unofficial mobile interface through a pinned
 [`korail2` fork](https://github.com/dhfhfk/korail2/tree/4b134266fff097ea0fd54e9f760cb128b6c8f878).
@@ -41,6 +42,10 @@ end = "18:00"
 departures = ["서울", "용산", "수서"]
 arrivals = ["대전", "서대전"]
 adults = 1
+allow_waitlist = true
+allow_standing = true
+# Unsupported by the pinned provider; true emits an official-app handoff warning.
+allow_mixed = false
 
 [provider]
 interval = 5.0
@@ -49,6 +54,17 @@ interval = 5.0
 Do not substitute another station silently. In particular, 광명 and 수원 are
 not part of this trip. If the unofficial API cannot expose 수서 service, those
 exact searches return no trains; the watcher never substitutes another station.
+
+The pinned provider supports general and special seats plus waitlist and
+standing-only. Standing+seat is an accepted preference, but its full-route
+multi-stage handling is not yet verified; requesting it prints an explicit
+warning and directs you to the official Korail app while supported modes
+continue. No request flag or partial booking is invented for an unsupported mode.
+Standing-only is attempted only for the provider's exact standing availability
+markers, and authoritative account readback must confirm exactly one passenger
+on the exact train. A standing result stays standing; an exact one-seat result
+is recorded as seated and is never relabeled. The request path is offline-tested
+but has not produced a live reservation in this release.
 
 ## Use
 
@@ -95,14 +111,16 @@ korail-watch status
 ```
 
 `status` is read-only and remains available while a watcher holds the process
-lock. Reconciliation accepts only a confirmed seated reservation for exactly
-one passenger; waitlist or missing seating metadata is treated as ambiguous and
-stops new attempts.
+lock. A queue entry appears separately from a confirmed hold. While queued, the
+watcher monitors that same reservation and never starts another booking. Missing
+or uncertain queue state is treated as ambiguous and stops new attempts.
 
-When a hold succeeds, open the official Korail app immediately and pay before
-the provider's actual deadline shown in the notification. If the deadline is
-unavailable, check the app immediately. The program never invents a payment
-window and never pays for you.
+A waitlist notification does not mean a seat is allocated and never asks for
+payment. When Korail allocates the queue entry, the watcher records a hold and
+sends a new notification. Only then should you open the official Korail app and
+pay before the provider's actual deadline. If the allocated hold has no deadline,
+check the app immediately. The program never invents a payment window and never
+pays for you.
 
 ## Recovery and safety
 
@@ -117,12 +135,17 @@ bounded backoff while booking remains frozen. A non-retryable Telegram error
 stops the process but preserves both the hold and pending notification for
 operator recovery.
 
+Legacy state remains compatible: a stored hold without a `kind` is treated as a
+seated hold. Do not delete queue or hold state to force another attempt.
+
 The watcher uses one authenticated session, at least five seconds between
 requests, bounded retry behavior, and no parallel accounts, proxies, queue
 bypass, or automatic retries of uncertain reservation writes. It cannot
 guarantee availability, outcompete other users, or promise uninterrupted API
 access. Offline tests pass no credentials and contact neither Korail nor
-Telegram. Credentialed live acceptance has not yet been verified.
+Telegram. Credentialed login, a read-only full-window search, and Telegram were
+verified on 2026-09-17. Waitlist mutation/allocation and standing or mixed
+booking have not been live-tested.
 
 ## Development
 
@@ -133,6 +156,7 @@ python -m unittest discover -v
 CI runs the offline suite on Python 3.11 and 3.13. See [DESIGN.md](DESIGN.md)
 for invariants and research, including the
 [original `korail2` project](https://github.com/carpedm20/korail2), the
+[mobile mutation handoff notes](https://github.com/yakisoba0728/korail-mobile-api/blob/main/docs/MUTATION_HANDOFF.md),
 [Korail Chuseok notice](https://info.korail.com/info/selectBbsNttView.do?bbsNo=199&key=911&nttNo=27180),
 and the [Telegram `sendMessage` API](https://core.telegram.org/bots/api#sendmessage).
 

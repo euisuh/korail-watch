@@ -62,12 +62,17 @@ class RawTrain:
     arr_date = "20260924"
     arr_time = "130000"
     run_date = "20260924"
+    general_seat = "11"
+    wait_reserve_flag = 0
 
     def has_general_seat(self):
         return True
 
     def has_special_seat(self):
         return False
+
+    def has_general_waiting_list(self):
+        return self.wait_reserve_flag == 9
 
 
 class RawReservation(RawTrain):
@@ -76,17 +81,23 @@ class RawReservation(RawTrain):
     buy_limit_time = "143000"
     price = 23700
     seat_no_count = 1
+    standing_no_count = 0
     reservation_type_code = "3"
 
 
 class RawTicket(RawTrain):
     price = 23700
+    seat_no_count = 1
 
     def get_ticket_no(self):
         return "ticket-1"
 
 
 class FakeClient:
+    _device = "AD"
+    _version = "250601002"
+    _key = "session-key"
+
     def __init__(self):
         self.search_args = None
         self.reserve_args = None
@@ -105,6 +116,11 @@ class FakeClient:
 
     def tickets(self):
         return [RawTicket()]
+
+    def _result_check(self, payload):
+        if payload.get("strResult") == "FAIL":
+            raise _KorailError()
+        return True
 
 
 def provider(client=None):
@@ -133,6 +149,8 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual("12:00", trains[0].dep_time)
         self.assertTrue(trains[0].general)
         self.assertFalse(trains[0].special)
+        self.assertFalse(trains[0].waitlist)
+        self.assertFalse(trains[0].standing)
         self.assertIsInstance(trains[0].raw, RawTrain)
 
     def test_reserve_is_exact_class_never_waits_and_suppresses_sdk_print(self):
@@ -153,6 +171,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual("reservation-1", hold.reference)
         self.assertEqual("2026-09-24T14:30:00+09:00", hold.deadline)
         self.assertFalse(hold.paid)
+        self.assertEqual("seated", hold.kind)
 
     def test_reserve_unknown_or_missing_result_is_ambiguous(self):
         for failure in (requests.Timeout(), None):
@@ -185,15 +204,162 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual("ticket-1", tickets[0].reference)
         self.assertIsNone(tickets[0].deadline)
 
-    def test_reconciliation_never_labels_waitlist_or_unknown_status_as_a_hold(self):
-        for reservation_type in ("8", None):
-            raw = RawReservation()
-            raw.reservation_type_code = reservation_type
-            client = FakeClient()
-            client.reservations = lambda value=raw: [value]
-            with self.subTest(reservation_type=reservation_type):
-                with self.assertRaises(AmbiguousReservation):
-                    provider(client).reservations()
+    def test_reconciliation_distinguishes_waitlist_allocation_and_unknown(self):
+        raw = RawReservation()
+        raw.reservation_type_code = "8"
+        client = FakeClient()
+        client.reservations = lambda: [raw]
+        queued = provider(client).reservations()[0]
+        self.assertEqual("waitlist", queued.kind)
+        self.assertIsNone(queued.deadline)
+
+        raw.reservation_type_code = "3"
+        allocated = provider(client).reservations()[0]
+        self.assertEqual("seated", allocated.kind)
+        self.assertIsNotNone(allocated.deadline)
+
+        raw.reservation_type_code = None
+        with self.assertRaises(AmbiguousReservation):
+            provider(client).reservations()
+
+    def test_waitlist_uses_1102_followup_and_preserves_stale_seat_intent(self):
+        class WaitTrain(RawTrain):
+            wait_reserve_flag = 9
+
+        class WaitReservation(RawReservation):
+            rsv_id = "queue-1"
+            reservation_type_code = "8"
+
+        client = FakeClient()
+        adapter = provider(client)
+
+        def reserve(*args, **kwargs):
+            client.reserve_args = (args, kwargs)
+            self.assertEqual("1102", adapter._session.reservation_overrides["txtJobId"])
+            adapter._session.last_reservation_response = {
+                "strResult": "SUCC",
+                "h_msg_cd": "IRR000014",
+                "h_pnr_no": "queue-1",
+            }
+            return WaitReservation()
+
+        client.reserve = reserve
+        client.reservations = lambda: [WaitReservation()]
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({"strResult": "SUCC", "h_msg_cd": "IRZ000003"}).encode()
+
+        with patch.object(adapter._session, "post", return_value=response) as post:
+            hold = adapter.reserve(adapter._train(WaitTrain()), "waitlist", 1)
+
+        self.assertEqual("waitlist", hold.kind)
+        self.assertIsNone(hold.deadline)
+        self.assertTrue(client.reserve_args[1]["try_waiting"])
+        data = post.call_args.kwargs["data"]
+        self.assertEqual(korail._RESERVATION_WAIT, post.call_args.args[0])
+        self.assertEqual("queue-1", data["txtPnrNo"])
+        self.assertEqual("Y", data["txtPsrmClChgFlg"])
+        self.assertEqual("N", data["txtSmsSndFlg"])
+        self.assertNotIn("txtCpNo", data)
+
+    def test_waitlist_followup_failure_is_ambiguous_and_not_retried(self):
+        class WaitTrain(RawTrain):
+            general_seat = "13"
+            wait_reserve_flag = 9
+
+            def has_general_seat(self):
+                return False
+
+        client = FakeClient()
+        adapter = provider(client)
+
+        def reserve(*args, **kwargs):
+            adapter._session.last_reservation_response = {
+                "strResult": "SUCC",
+                "h_msg_cd": "IRR000014",
+                "h_pnr_no": "queue-1",
+            }
+            return None
+
+        client.reserve = reserve
+        with patch.object(adapter._session, "post", side_effect=requests.Timeout()) as post:
+            with self.assertRaises(AmbiguousReservation):
+                adapter.reserve(adapter._train(WaitTrain()), "waitlist", 1)
+        post.assert_called_once()
+
+    def test_waitlist_post_create_security_block_stops_before_followup(self):
+        class WaitTrain(RawTrain):
+            wait_reserve_flag = 9
+
+        client = FakeClient()
+        adapter = provider(client)
+
+        def reserve(*args, **kwargs):
+            adapter._session.last_reservation_response = {
+                "strResult": "SUCC",
+                "h_msg_cd": "IRR000014",
+                "h_pnr_no": "queue-1",
+            }
+            response = requests.Response()
+            response.status_code = 403
+            raise requests.HTTPError(response=response)
+
+        client.reserve = reserve
+        with patch.object(adapter._session, "post") as post:
+            with self.assertRaises(BlockedError):
+                adapter.reserve(adapter._train(WaitTrain()), "waitlist", 1)
+        post.assert_not_called()
+
+    def test_standing_requires_exact_search_codes_and_readback_count(self):
+        class StandingTrain(RawTrain):
+            general_seat = "13"
+
+            def has_general_seat(self):
+                return False
+
+        class StandingReservation(RawReservation):
+            seat_no_count = 0
+            standing_no_count = 1
+
+        raw = StandingTrain()
+        client = FakeClient()
+        adapter = provider(client)
+        adapter._session.search_status[korail._raw_key(raw)] = ("13", "11")
+
+        def reserve(selected, *args, **kwargs):
+            self.assertIs(selected._raw, raw)
+            self.assertTrue(selected.has_general_seat())
+            self.assertFalse(raw.has_general_seat())
+            self.assertEqual({"txtStndFlg": "Y"}, adapter._session.reservation_overrides)
+            return StandingReservation()
+
+        client.reserve = reserve
+        train = adapter._train(raw)
+        self.assertTrue(train.standing)
+        hold = adapter.reserve(train, "standing", 1)
+        self.assertEqual("standing", hold.kind)
+        self.assertEqual({}, adapter._session.reservation_overrides)
+        self.assertFalse(raw.has_general_seat())
+
+        # Inventory may reopen between search and 1101. One confirmed seat on
+        # the exact train is a stronger entitlement than the standing request.
+        client.reserve = lambda *args, **kwargs: RawReservation()
+        upgraded = adapter.reserve(train, "standing", 1)
+        self.assertEqual("seated", upgraded.kind)
+
+        adapter._session.search_status[korail._raw_key(raw)] = ("13", "13")
+        with self.assertRaises(SoldOut):
+            adapter.reserve(adapter._train(raw), "standing", 1)
+
+    def test_reserve_rejects_unsupported_modes_and_non_single_adult(self):
+        adapter = provider()
+        train = adapter._train(RawTrain())
+        self.assertEqual(frozenset(("waitlist", "standing")), adapter.supported_modes)
+        for kind in ("mixed", "other"):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                adapter.reserve(train, kind, 1)
+        with self.assertRaises(ValueError):
+            adapter.reserve(train, "general", 2)
 
     def test_pinned_sdk_discarded_status_is_retained_at_session_boundary(self):
         import korail2
@@ -209,6 +375,7 @@ class ProviderTests(unittest.TestCase):
                                     "h_pnr_no": "reservation-1",
                                     "h_rsv_tp_cd": "3",
                                     "h_tot_seat_cnt": "1",
+                                    "h_tot_stnd_cnt": "0",
                                     "h_run_dt": "20260924",
                                     "h_ntisu_lmt_dt": "20260924",
                                     "h_ntisu_lmt_tm": "143000",
@@ -241,14 +408,211 @@ class ProviderTests(unittest.TestCase):
             holds = adapter.reservations()
 
         self.assertEqual("reservation-1", holds[0].reference)
+        self.assertEqual("seated", holds[0].kind)
         self.assertFalse(hasattr(holds[0].train.raw, "reservation_type_code"))
 
         payload["jrny_infos"]["jrny_info"][0]["train_infos"]["train_info"][0]["h_rsv_tp_cd"] = "8"
         response._content = json.dumps(payload).encode()
         korail._NEXT_REQUEST = 0.0
         with patch.object(requests.Session, "request", return_value=response):
-            with self.assertRaises(AmbiguousReservation):
-                adapter.reservations()
+            holds = adapter.reservations()
+        self.assertEqual("waitlist", holds[0].kind)
+        self.assertIsNone(holds[0].deadline)
+
+    def test_pinned_sdk_waitlist_wire_and_followup_are_integrated(self):
+        import korail2
+        from korail2 import korail2 as implementation
+
+        raw = implementation.Train(
+            {
+                "h_trn_clsf_cd": "100",
+                "h_trn_clsf_nm": "KTX",
+                "h_trn_no": "001",
+                "h_trn_gp_cd": "100",
+                "h_dpt_rs_stn_nm": "서울",
+                "h_dpt_rs_stn_cd": "0001",
+                "h_dpt_dt": "20260924",
+                "h_dpt_tm": "120000",
+                "h_arv_rs_stn_nm": "대전",
+                "h_arv_rs_stn_cd": "0010",
+                "h_arv_dt": "20260924",
+                "h_arv_tm": "130000",
+                "h_run_dt": "20260924",
+                "h_rsv_psb_flg": "Y",
+                "h_rsv_psb_nm": "예약 가능",
+                "h_gen_rsv_cd": "11",
+                "h_spe_rsv_cd": "13",
+                "h_wait_rsv_flg": " 9",
+            }
+        )
+        history = {
+            "strResult": "SUCC",
+            "jrny_infos": {
+                "jrny_info": [
+                    {
+                        "train_infos": {
+                            "train_info": [
+                                {
+                                    "h_pnr_no": "queue-1",
+                                    "h_rsv_tp_cd": "8",
+                                    "h_tot_seat_cnt": "1",
+                                    "h_tot_stnd_cnt": "0",
+                                    "h_run_dt": "20260924",
+                                    "h_ntisu_lmt_dt": "20260924",
+                                    "h_ntisu_lmt_tm": "143000",
+                                    "h_rsv_amt": "23700",
+                                    "h_trn_clsf_cd": "100",
+                                    "h_trn_no": "001",
+                                    "h_trn_gp_cd": "100",
+                                    "h_dpt_rs_stn_nm": "서울",
+                                    "h_dpt_tm": "120000",
+                                    "h_arv_rs_stn_nm": "대전",
+                                    "h_arv_tm": "130000",
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        }
+        first = {"strResult": "SUCC", "h_msg_cd": "IRR000014", "h_pnr_no": "queue-1"}
+        followup = {"strResult": "SUCC", "h_msg_cd": "IRZ000003"}
+        calls = []
+
+        def response(payload, url):
+            result = requests.Response()
+            result.status_code = 200
+            result.url = url
+            result._content = json.dumps(payload).encode()
+            result.encoding = "utf-8"
+            return result
+
+        def request(_session, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith(".certification.TicketReservation"):
+                self.assertEqual("1102", kwargs["params"]["txtJobId"])
+                self.assertEqual("N", kwargs["params"]["txtStndFlg"])
+                return response(first, url)
+            if url == korail._RESERVATION_WAIT:
+                self.assertEqual("POST", method)
+                self.assertEqual("Y", kwargs["data"]["txtPsrmClChgFlg"])
+                self.assertNotIn("txtCpNo", kwargs["data"])
+                return response(followup, url)
+            if url.endswith(".reservation.ReservationView"):
+                return response(history, url)
+            raise AssertionError(f"unexpected offline request: {url}")
+
+        adapter = KorailProvider()
+        client = korail2.Korail("member", "password", auto_login=False, want_feedback=False)
+        client._session = adapter._session
+        adapter._sdk, adapter._client = korail2, client
+
+        with patch.object(requests.Session, "request", request), patch(
+            "korail_watch.korail.time.sleep"
+        ):
+            hold = adapter.reserve(adapter._train(raw), "waitlist", 1)
+
+        self.assertEqual("queue-1", hold.reference)
+        self.assertEqual("waitlist", hold.kind)
+        self.assertEqual(4, len(calls))
+
+    def test_schedule_capture_drives_pinned_sdk_standing_1101_wire(self):
+        import korail2
+
+        row = {
+            "h_trn_clsf_cd": "100",
+            "h_trn_clsf_nm": "KTX",
+            "h_trn_no": "001",
+            "h_trn_gp_cd": "100",
+            "h_dpt_rs_stn_nm": "서울",
+            "h_dpt_rs_stn_cd": "0001",
+            "h_dpt_dt": "20260924",
+            "h_dpt_tm": "120000",
+            "h_arv_rs_stn_nm": "대전",
+            "h_arv_rs_stn_cd": "0010",
+            "h_arv_dt": "20260924",
+            "h_arv_tm": "130000",
+            "h_run_dt": "20260924",
+            "h_rsv_psb_flg": "Y",
+            "h_rsv_psb_nm": "입석 가능",
+            "h_gen_rsv_cd": "13",
+            "h_spe_rsv_cd": "13",
+            "h_stnd_rsv_cd": "11",
+            "h_wait_rsv_flg": " 0",
+        }
+        history_row = {
+            "h_pnr_no": "standing-1",
+            "h_rsv_tp_cd": "3",
+            "h_tot_seat_cnt": "0",
+            "h_tot_stnd_cnt": "1",
+            "h_run_dt": "20260924",
+            "h_ntisu_lmt_dt": "20260924",
+            "h_ntisu_lmt_tm": "143000",
+            "h_rsv_amt": "19800",
+            "h_trn_clsf_cd": "100",
+            "h_trn_no": "001",
+            "h_trn_gp_cd": "100",
+            "h_dpt_rs_stn_nm": "서울",
+            "h_dpt_tm": "120000",
+            "h_arv_rs_stn_nm": "대전",
+            "h_arv_tm": "130000",
+        }
+        calls = []
+
+        def response(payload, url):
+            result = requests.Response()
+            result.status_code = 200
+            result.url = url
+            result._content = json.dumps(payload).encode()
+            result.encoding = "utf-8"
+            return result
+
+        def request(_session, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith(".seatMovie.ScheduleView"):
+                return response({"strResult": "SUCC", "trn_infos": {"trn_info": [row]}}, url)
+            if url.endswith(".certification.TicketReservation"):
+                self.assertEqual("1101", kwargs["params"]["txtJobId"])
+                self.assertEqual("Y", kwargs["params"]["txtStndFlg"])
+                return response({"strResult": "SUCC", "h_pnr_no": "standing-1"}, url)
+            if url.endswith(".reservation.ReservationView"):
+                return response(
+                    {
+                        "strResult": "SUCC",
+                        "jrny_infos": {
+                            "jrny_info": [{"train_infos": {"train_info": [history_row]}}]
+                        },
+                    },
+                    url,
+                )
+            raise AssertionError(f"unexpected offline request: {url}")
+
+        adapter = KorailProvider()
+        client = korail2.Korail("member", "password", auto_login=False, want_feedback=False)
+        client._session = adapter._session
+        adapter._sdk, adapter._client = korail2, client
+        trip = Trip("2026-09-24", "12:00", "18:00", ("서울",), ("대전",))
+
+        with patch.object(requests.Session, "request", request), patch(
+            "korail_watch.korail.time.sleep"
+        ):
+            train = adapter.search(trip, "서울", "대전", "12:00:00")[0]
+            self.assertTrue(train.standing)
+            self.assertFalse(train.general)
+            self.assertFalse(hasattr(train.raw, "standing_reservation_code"))
+            hold = adapter.reserve(train, "standing", 1)
+
+        self.assertEqual("standing", hold.kind)
+        self.assertEqual("standing-1", hold.reference)
+        self.assertEqual(3, len(calls))
+
+    def test_paid_zero_seats_is_not_assumed_to_be_one_standing_adult(self):
+        raw = RawTicket()
+        raw.seat_no_count = 0
+        client = FakeClient()
+        client.tickets = lambda: [raw]
+        with self.assertRaises(AmbiguousReservation):
+            provider(client).tickets()
 
     def test_session_paces_every_request_and_applies_timeout(self):
         clock = [100.0]

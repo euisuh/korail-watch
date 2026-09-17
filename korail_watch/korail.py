@@ -20,6 +20,10 @@ from .domain import AmbiguousReservation, BlockedError, Hold, SoldOut, Train, Tr
 _PACE_LOCK = threading.Lock()
 _NEXT_REQUEST = 0.0
 _KST = ZoneInfo("Asia/Seoul")
+_RESERVATION_WAIT = (
+    "https://smart.letskorail.com:443/classes/"
+    "com.korail.mobile.reservationWait.ReservationWait"
+)
 
 
 def _retry_after(value: str | None) -> float | None:
@@ -39,10 +43,19 @@ class _PacedSession(requests.Session):
         super().__init__()
         self.interval = max(5.0, float(interval))
         self.timeout = float(timeout)
-        self.reservation_status: dict[str, tuple[str | None, int | None] | None] = {}
+        self.reservation_status: dict[
+            str, tuple[str | None, int | None, int | None] | None
+        ] = {}
+        self.search_status: dict[str, tuple[str | None, str | None]] = {}
+        self.reservation_overrides: dict[str, str] = {}
+        self.last_reservation_response: dict | None = None
 
     def request(self, method, url, **kwargs):
         global _NEXT_REQUEST
+        endpoint = url.rstrip("/")
+        if endpoint.endswith(".certification.TicketReservation") and self.reservation_overrides:
+            key = "params" if "params" in kwargs else "data"
+            kwargs[key] = {**(kwargs.get(key) or {}), **self.reservation_overrides}
         with _PACE_LOCK:
             delay = _NEXT_REQUEST - time.monotonic()
             if delay > 0:
@@ -58,18 +71,43 @@ class _PacedSession(requests.Session):
                 with _PACE_LOCK:
                     _NEXT_REQUEST = max(_NEXT_REQUEST, time.monotonic() + retry)
         response.raise_for_status()
-        if url.rstrip("/").endswith(".reservation.ReservationView"):
+        if endpoint.endswith(".seatMovie.ScheduleView"):
+            self._capture_search_status(response)
+        elif endpoint.endswith(".certification.TicketReservation"):
+            try:
+                payload = response.json()
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            self.last_reservation_response = payload if isinstance(payload, dict) else None
+        elif endpoint.endswith(".reservation.ReservationView"):
             self._capture_reservation_status(response)
         return response
 
+    def _capture_search_status(self, response) -> None:
+        snapshot: dict[str, tuple[str | None, str | None]] = {}
+        try:
+            trains = response.json().get("trn_infos", {}).get("trn_info", [])
+            for train in trains:
+                snapshot[_record_key(train)] = (
+                    train.get("h_gen_rsv_cd"),
+                    train.get("h_stnd_rsv_cd"),
+                )
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        self.search_status = snapshot
+
     def _capture_reservation_status(self, response) -> None:
-        snapshot: dict[str, tuple[str | None, int | None] | None] = {}
+        snapshot: dict[str, tuple[str | None, int | None, int | None] | None] = {}
         try:
             journeys = response.json().get("jrny_infos", {}).get("jrny_info", [])
             for journey in journeys:
                 for train in journey.get("train_infos", {}).get("train_info", []):
                     reference = str(train["h_pnr_no"])
-                    value = (train.get("h_rsv_tp_cd"), _integer(train.get("h_tot_seat_cnt")))
+                    value = (
+                        train.get("h_rsv_tp_cd"),
+                        _integer(train.get("h_tot_seat_cnt")),
+                        _integer(train.get("h_tot_stnd_cnt")),
+                    )
                     snapshot[reference] = value if reference not in snapshot or snapshot[reference] == value else None
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -77,6 +115,8 @@ class _PacedSession(requests.Session):
 
 
 class KorailProvider:
+    supported_modes = frozenset(("waitlist", "standing"))
+
     def __init__(self, interval: float = 5.0, timeout: float = 15.0):
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -132,31 +172,76 @@ class KorailProvider:
         options = {
             "general": sdk.ReserveOption.GENERAL_ONLY,
             "special": sdk.ReserveOption.SPECIAL_ONLY,
+            "waitlist": sdk.ReserveOption.GENERAL_ONLY,
+            "standing": sdk.ReserveOption.GENERAL_ONLY,
         }
         if seat_class not in options:
-            raise ValueError("seat_class must be general or special")
-        if adults < 1:
-            raise ValueError("adults must be positive")
+            raise ValueError("unsupported reservation kind")
+        if adults != 1:
+            raise ValueError("exactly one adult is supported")
         if train.raw is None:
             raise ValueError("train does not contain its provider record")
+        if seat_class == "waitlist" and (
+            not train.waitlist
+            or not bool(getattr(train.raw, "has_general_waiting_list", lambda: False)())
+        ):
+            raise SoldOut("this train is not waitlist eligible")
+        if seat_class == "standing" and (
+            not train.standing
+            or self._session.search_status.get(_raw_key(train.raw)) != ("13", "11")
+        ):
+            raise SoldOut("this train has no supported standing inventory")
 
+        self._session.last_reservation_response = None
+        overrides = {}
+        raw = train.raw
+        try_waiting = seat_class == "waitlist"
+        if seat_class == "waitlist":
+            # The pinned SDK selects 1101 from stale seat availability before
+            # consulting try_waiting. The app instead keys queue intent on the
+            # exact h_wait_rsv_flg=9 search flag, so pin the evidenced job id.
+            overrides = {
+                "txtJobId": "1102",
+                "txtStndFlg": "Y" if train.standing else "N",
+            }
+        elif seat_class == "standing":
+            overrides = {"txtStndFlg": "Y"}
+            raw = _StandingPreflightTrain(train.raw)
+        self._session.reservation_overrides = overrides
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 reservation = client.reserve(
-                    train.raw,
+                    raw,
                     [sdk.AdultPassenger(adults)],
                     option=options[seat_class],
-                    try_waiting=False,
+                    try_waiting=try_waiting,
                 )
         except Exception as exc:
-            self._raise(exc, mutation=True)
+            if seat_class != "waitlist" or self._standby_reference() is None:
+                self._raise(exc, mutation=True)
+            try:
+                self._raise(exc, mutation=True)
+            except BlockedError:
+                raise
+            except Exception:
+                pass
+            reservation = None
+        finally:
+            self._session.reservation_overrides = {}
+
+        if seat_class == "waitlist":
+            return self._confirm_waitlist(train)
         if reservation is None:
             raise AmbiguousReservation("Korail did not return the created reservation")
-        if getattr(reservation, "seat_no_count", None) != adults:
-            raise AmbiguousReservation("Korail returned an unexpected seat count")
         try:
-            return self._hold(reservation, paid=False, known_seated=True)
-        except Exception:
+            hold = self._hold(reservation, paid=False)
+            accepted = {"standing", "seated"} if seat_class == "standing" else {"seated"}
+            if hold.kind not in accepted:
+                raise ValueError
+            return hold
+        except Exception as exc:
+            if isinstance(exc, BlockedError):
+                raise
             raise AmbiguousReservation("Korail reservation outcome is unknown") from None
 
     def reservations(self) -> list[Hold]:
@@ -179,7 +264,7 @@ class KorailProvider:
         return self._client, self._sdk
 
     @staticmethod
-    def _train(raw) -> Train:
+    def _raw_train(raw, *, standing: bool = False, waitlist: bool = False) -> Train:
         date = _date(raw.dep_date)
         dep_time = _clock(raw.dep_time)
         arr_time = _clock(raw.arr_time)
@@ -196,12 +281,30 @@ class KorailProvider:
             general=bool(raw.has_general_seat()),
             special=bool(raw.has_special_seat()),
             raw=raw,
+            waitlist=waitlist,
+            standing=standing,
         )
 
-    def _hold(self, raw, *, paid: bool, known_seated: bool = False) -> Hold:
+    def _train(self, raw) -> Train:
+        general, standing = self._session.search_status.get(
+            _raw_key(raw),
+            (getattr(raw, "general_seat", None), None),
+        )
+        return self._raw_train(
+            raw,
+            waitlist=bool(getattr(raw, "has_general_waiting_list", lambda: False)()),
+            standing=general == "13" and standing == "11",
+        )
+
+    def _hold(self, raw, *, paid: bool) -> Hold:
         if paid:
             reference = raw.get_ticket_no()
             deadline = None
+            seats = _integer(getattr(raw, "seat_no_count", None))
+            if seats == 1:
+                kind = "seated"
+            else:
+                raise AmbiguousReservation("Korail ticket seating status is unavailable")
         else:
             reference = raw.rsv_id
             status = self._session.reservation_status.get(str(reference))
@@ -209,11 +312,21 @@ class KorailProvider:
                 status = (
                     getattr(raw, "reservation_type_code", None),
                     getattr(raw, "seat_no_count", None),
+                    getattr(raw, "standing_no_count", None),
                 )
-            # korail2 drops h_rsv_tp_cd; the paced session retains only this status tuple.
-            if not known_seated and (str(status[0]).lstrip("0") != "3" or status[1] != 1):
+            code = str(status[0]).lstrip("0")
+            seats, standing = status[1:]
+            if code == "8" and seats == 1 and standing == 0:
+                kind = "waitlist"
+                deadline = None
+            elif code == "3" and seats == 1 and standing == 0:
+                kind = "seated"
+                deadline = _deadline(raw.buy_limit_date, raw.buy_limit_time)
+            elif code == "3" and seats == 0 and standing == 1:
+                kind = "standing"
+                deadline = _deadline(raw.buy_limit_date, raw.buy_limit_time)
+            else:
                 raise AmbiguousReservation("Korail reservation seating status is unavailable")
-            deadline = _deadline(raw.buy_limit_date, raw.buy_limit_time)
         if reference in (None, ""):
             raise ValueError("provider record has no reference")
         return Hold(
@@ -222,7 +335,49 @@ class KorailProvider:
             deadline=deadline,
             price=_integer(getattr(raw, "price", None)),
             paid=paid,
+            kind=kind,
         )
+
+    def _standby_reference(self) -> str | None:
+        payload = self._session.last_reservation_response
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("strResult") != "SUCC" or payload.get("h_msg_cd") != "IRR000014":
+            return None
+        reference = payload.get("h_pnr_no")
+        return str(reference) if reference not in (None, "") else None
+
+    def _confirm_waitlist(self, train: Train) -> Hold:
+        client, _ = self._ready()
+        reference = self._standby_reference()
+        if reference is None:
+            raise AmbiguousReservation("Korail waitlist outcome is unknown")
+        data = {
+            "Device": client._device,
+            "Version": client._version,
+            "Key": client._key,
+            "txtPnrNo": reference,
+            "txtPsrmClChgFlg": "Y",
+            "txtSmsSndFlg": "N",
+        }
+        try:
+            response = self._session.post(_RESERVATION_WAIT, data=data)
+            payload = response.json()
+            with contextlib.redirect_stdout(io.StringIO()):
+                client._result_check(payload)
+            if payload.get("strResult") != "SUCC" or payload.get("h_msg_cd") != "IRZ000003":
+                raise ValueError
+            matches = [item for item in self.reservations() if item.reference == reference]
+        except Exception as exc:
+            try:
+                self._raise(exc, mutation=True)
+            except BlockedError:
+                raise
+            except Exception:
+                raise AmbiguousReservation("Korail waitlist outcome is unknown") from None
+        if len(matches) != 1 or matches[0].kind != "waitlist" or matches[0].train.key != train.key:
+            raise AmbiguousReservation("Korail waitlist outcome is unknown")
+        return matches[0]
 
     def _raise(self, exc: Exception, *, mutation: bool = False):
         if isinstance(exc, (SoldOut, TransientError, BlockedError, AmbiguousReservation)):
@@ -272,3 +427,49 @@ def _deadline(date: str | None, clock: str | None) -> str | None:
 
 def _integer(value) -> int | None:
     return int(value) if value not in (None, "") else None
+
+
+def _record_key(raw: dict) -> str:
+    return "|".join(
+        str(raw.get(name, ""))
+        for name in (
+            "h_dpt_dt",
+            "h_trn_clsf_cd",
+            "h_trn_no",
+            "h_dpt_rs_stn_nm",
+            "h_dpt_tm",
+            "h_arv_rs_stn_nm",
+            "h_arv_tm",
+        )
+    )
+
+
+def _raw_key(raw) -> str:
+    return "|".join(
+        str(value)
+        for value in (
+            raw.dep_date,
+            raw.train_type,
+            raw.train_no,
+            raw.dep_name,
+            raw.dep_time,
+            raw.arr_name,
+            raw.arr_time,
+        )
+    )
+
+
+class _StandingPreflightTrain:
+    """Pass one proven 13/11 row through korail2's seat-only preflight."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def has_seat(self):
+        return True
+
+    def has_general_seat(self):
+        return True

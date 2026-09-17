@@ -39,6 +39,9 @@ def _train_data(train: Train) -> dict:
         "arr_time": train.arr_time,
         "general": train.general,
         "special": train.special,
+        "waitlist": train.waitlist,
+        "standing": train.standing,
+        "mixed": train.mixed,
     }
 
 
@@ -49,7 +52,22 @@ def _hold_data(hold: Hold) -> dict:
         "deadline": hold.deadline,
         "price": hold.price,
         "paid": hold.paid,
+        "kind": hold.kind,
     }
+
+
+def _hold_from_data(data: dict) -> Hold:
+    train = dict(data["train"])
+    for capability in ("waitlist", "standing", "mixed"):
+        train.setdefault(capability, False)
+    return Hold(
+        reference=data["reference"],
+        train=Train(**train),
+        deadline=data.get("deadline"),
+        price=data.get("price"),
+        paid=data.get("paid", False),
+        kind=data.get("kind", "seated"),
+    )
 
 
 def _same_train(left: Train, right: Train) -> bool:
@@ -124,10 +142,16 @@ def _set(db: sqlite3.Connection, key: str, value) -> None:
 
 
 def _message(hold: Hold) -> str:
+    if hold.kind == "waitlist":
+        return (
+            f"Korail waitlist {hold.reference}: {hold.train.departure} → {hold.train.arrival}, "
+            f"{hold.train.date} {hold.train.dep_time}; queued only, no seat is guaranteed. "
+            "Check the Korail app; payment is not due unless allocation is confirmed."
+        )
     payment = hold.deadline or "unavailable; check the Korail app immediately"
     price = f"; price {hold.price:,} KRW" if hold.price is not None else ""
     return (
-        f"Korail {'ticket' if hold.paid else 'reservation'} {hold.reference}: "
+        f"Korail {'ticket' if hold.paid else hold.kind + ' reservation'} {hold.reference}: "
         f"{hold.train.departure} → {hold.train.arrival}, {hold.train.date} "
         f"{hold.train.dep_time}; payment deadline {payment}{price}"
     )
@@ -136,9 +160,19 @@ def _message(hold: Hold) -> str:
 def _confirm(db: sqlite3.Connection, hold: Hold) -> None:
     with db:
         _set(db, "hold", _hold_data(hold))
-        db.execute("DELETE FROM state WHERE key IN ('intent', 'ambiguous_hold')")
+        db.execute("DELETE FROM state WHERE key IN ('intent', 'ambiguous_hold', 'queue', 'queue_unknown')")
         db.execute(
-            "INSERT OR IGNORE INTO outbox(id, payload) VALUES (1, ?)",
+            "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+            (_message(hold),),
+        )
+
+
+def _confirm_queue(db: sqlite3.Connection, hold: Hold) -> None:
+    with db:
+        _set(db, "queue", _hold_data(hold))
+        db.execute("DELETE FROM state WHERE key IN ('intent', 'ambiguous_hold', 'hold', 'queue_unknown')")
+        db.execute(
+            "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
             (_message(hold),),
         )
 
@@ -146,6 +180,27 @@ def _confirm(db: sqlite3.Connection, hold: Hold) -> None:
 def _preserve_mismatch(db: sqlite3.Connection, hold: Hold) -> None:
     with db:
         _set(db, "ambiguous_hold", _hold_data(hold))
+
+
+def _preserve_queue_unknown(db: sqlite3.Connection, queued: dict, remote: list[Hold], reason: str) -> None:
+    with db:
+        _set(
+            db,
+            "queue_unknown",
+            {
+                "observed_at": _now().isoformat(),
+                "reason": reason,
+                "queue": queued,
+                "remote": [_hold_data(hold) for hold in remote],
+            },
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
+            (
+                f"Korail waitlist {queued['reference']} can no longer be confirmed ({reason}). "
+                "Do not create another booking automatically; check the Korail app.",
+            ),
+        )
 
 
 def _drain_outbox(db: sqlite3.Connection, notifier, *, wait: bool = False) -> None:
@@ -181,6 +236,14 @@ def _drain_outbox(db: sqlite3.Connection, notifier, *, wait: bool = False) -> No
             return
 
 
+def _drain_queue_outbox(db: sqlite3.Connection, notifier) -> None:
+    try:
+        _drain_outbox(db, notifier, wait=False)
+    except BlockedError:
+        # A broken notification channel must not delay allocation detection.
+        pass
+
+
 def _windows(trip: Trip) -> list[str]:
     start_hour, _ = map(int, trip.start.split(":"))
     end_hour, _ = map(int, trip.end.split(":"))
@@ -209,6 +272,14 @@ def _past_cutoff(trip: Trip) -> bool:
     return now.date() > trip_date or (now.date() == trip_date and now.strftime("%H:%M") >= trip.end)
 
 
+def _supported_modes(provider) -> frozenset[str]:
+    modes = getattr(provider, "supported_modes", frozenset(("general", "special")))
+    allowed = {"general", "special", "waitlist", "standing", "mixed"}
+    if not isinstance(modes, frozenset) or not modes <= allowed:
+        raise TypeError("provider supported_modes is invalid")
+    return modes | frozenset(("general", "special"))
+
+
 def _remote_holds(provider) -> list[Hold]:
     reservations = provider.reservations()
     tickets = provider.tickets()
@@ -217,6 +288,45 @@ def _remote_holds(provider) -> list[Hold]:
     if any(not isinstance(item, Hold) for item in reservations + tickets):
         raise TypeError("provider reconciliation returned invalid data")
     return reservations + tickets
+
+
+def _monitor_queue(db: sqlite3.Connection, provider, notifier, *, wait: bool) -> str:
+    queued = _get(db, "queue")
+    while True:
+        _drain_queue_outbox(db, notifier)
+        try:
+            remote = _remote_holds(provider)
+        except BlockedError:
+            return "blocked"
+        except TransientError as exc:
+            if not wait:
+                return "queue-incomplete"
+            time.sleep(max(1.0, exc.retry_after if exc.retry_after is not None else 30.0))
+            continue
+        except Exception:
+            _preserve_queue_unknown(db, queued, [], "read-unknown")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
+
+        current = next((hold for hold in remote if hold.reference == queued["reference"]), None)
+        if current is None:
+            _preserve_queue_unknown(db, queued, remote, "missing")
+            _drain_queue_outbox(db, notifier)
+            return "queue-missing"
+        original = _hold_from_data(queued)
+        if not _same_train(current.train, original.train):
+            _preserve_queue_unknown(db, queued, remote, "identity-mismatch")
+            _drain_queue_outbox(db, notifier)
+            return "ambiguous"
+        if current.kind != "waitlist":
+            _confirm(db, current)
+            _drain_outbox(db, notifier, wait=wait)
+            return "allocated"
+        with db:
+            _set(db, "queue", _hold_data(current))
+        if not wait:
+            return "queued"
+        time.sleep(30.0)
 
 
 def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
@@ -237,29 +347,62 @@ def _reconcile(db: sqlite3.Connection, trip: Trip, provider) -> str | None:
         intended = Train(**intent["train"])
         exact = next((hold for hold in remote if _same_train(hold.train, intended)), None)
         if exact:
-            _confirm(db, exact)
-            return "existing-ticket" if exact.paid else "existing-hold"
+            requested = intent.get("kind", intent.get("seat_class"))
+            expected = "seated" if requested in ("general", "special") else requested
+            if requested == "waitlist" and exact.kind != "waitlist":
+                _confirm(db, exact)
+                return "allocated"
+            if requested == "waitlist" and exact.kind == "waitlist":
+                _preserve_queue_unknown(
+                    db,
+                    _hold_data(exact),
+                    remote,
+                    "waitlist-followup-unproven",
+                )
+                return "ambiguous"
+            if exact.kind == expected or (requested == "standing" and exact.kind == "seated"):
+                _confirm(db, exact)
+                return "existing-ticket" if exact.paid else "existing-hold"
+            _preserve_mismatch(db, exact)
+            return "ambiguous"
         matching = next((hold for hold in remote if _matches_trip(trip, hold.train)), None)
         if matching:
             _preserve_mismatch(db, matching)
         return "ambiguous"
 
-    matching = next((hold for hold in remote if _matches_trip(trip, hold.train)), None)
+    matching = next(
+        (hold for hold in remote if hold.kind != "waitlist" and _matches_trip(trip, hold.train)),
+        None,
+    ) or next((hold for hold in remote if _matches_trip(trip, hold.train)), None)
     if matching:
+        if matching.kind == "waitlist":
+            _preserve_queue_unknown(
+                db,
+                _hold_data(matching),
+                remote,
+                "existing-waitlist-unverified",
+            )
+            return "ambiguous"
         _confirm(db, matching)
         return "existing-ticket" if matching.paid else "existing-hold"
     return None
 
 
-def _attempt(db: sqlite3.Connection, trip: Trip, provider, train: Train) -> str | None:
-    for seat_class, available in (("general", train.general), ("special", train.special)):
+def _attempt(
+    db: sqlite3.Connection,
+    trip: Trip,
+    provider,
+    train: Train,
+    kinds: tuple[tuple[str, bool], ...],
+) -> str | None:
+    for kind, available in kinds:
         if not available:
             continue
-        intent = {"train": _train_data(train), "seat_class": seat_class, "adults": trip.adults, "created_at": _now().isoformat()}
+        intent = {"train": _train_data(train), "kind": kind, "adults": trip.adults, "created_at": _now().isoformat()}
         with db:
             _set(db, "intent", intent)
         try:
-            hold = provider.reserve(train, seat_class, trip.adults)
+            hold = provider.reserve(train, kind, trip.adults)
         except SoldOut:
             with db:
                 db.execute("DELETE FROM state WHERE key = 'intent'")
@@ -270,10 +413,17 @@ def _attempt(db: sqlite3.Connection, trip: Trip, provider, train: Train) -> str 
         except (AmbiguousReservation, TransientError, Exception):
             result = _reconcile(db, trip, provider)
             return result or "ambiguous"
-        if not isinstance(hold, Hold) or not _same_train(hold.train, train):
+        expected = "seated" if kind in ("general", "special") else kind
+        accepted_kind = isinstance(hold, Hold) and (
+            hold.kind == expected or (kind == "standing" and hold.kind == "seated")
+        )
+        if not isinstance(hold, Hold) or not _same_train(hold.train, train) or not accepted_kind:
             if isinstance(hold, Hold):
                 _preserve_mismatch(db, hold)
             return "ambiguous"
+        if hold.kind == "waitlist":
+            _confirm_queue(db, hold)
+            return "waitlisted"
         _confirm(db, hold)
         return "reserved"
     return None
@@ -303,10 +453,22 @@ def run(
             return "locked"
         with closing(_connect(state_dir)) as db:
             wait_for_notification = armed and not once
-            _drain_outbox(db, notifier, wait=wait_for_notification)
             local = _get(db, "hold")
+            queue = _get(db, "queue")
+            queue_active = bool(queue or (local and local.get("kind", "seated") == "waitlist"))
+            if queue_active:
+                _drain_queue_outbox(db, notifier)
+            else:
+                _drain_outbox(db, notifier, wait=wait_for_notification)
             if local:
+                if local.get("kind", "seated") == "waitlist":
+                    _confirm_queue(db, _hold_from_data(local))
+                    return _monitor_queue(db, provider, notifier, wait=wait_for_notification)
                 return "existing-ticket" if local.get("paid") else "existing-hold"
+            if _get(db, "queue_unknown"):
+                return "ambiguous"
+            if queue:
+                return _monitor_queue(db, provider, notifier, wait=wait_for_notification)
             if _get(db, "reconciliation_unknown") or (_get(db, "ambiguous_hold") and not _get(db, "intent")):
                 return "ambiguous"
             result = _reconcile(db, trip, provider)
@@ -316,6 +478,11 @@ def run(
             if _past_cutoff(trip):
                 return "cutoff"
 
+            try:
+                supported = _supported_modes(provider)
+            except TypeError:
+                return "error"
+
             targets = _targets(trip)
             start = int(_get(db, "cursor") or 0) % len(targets)
             cycles = 1 if once or not armed else max_cycles
@@ -324,6 +491,9 @@ def run(
             incomplete = False
             while cycles is None or cycle < cycles:
                 attempted: set[str] = set()
+                waitlist_candidates: list[Train] = []
+                waitlist_keys: set[str] = set()
+                pass_incomplete = False
                 pages = deque(
                     (*targets[(start + offset) % len(targets)], (start + offset) % len(targets))
                     for offset in range(len(targets))
@@ -338,6 +508,7 @@ def run(
                         trains = provider.search(trip, departure, arrival, after)
                     except TransientError as exc:
                         incomplete = True
+                        pass_incomplete = True
                         time.sleep(max(0.0, exc.retry_after if exc.retry_after is not None else 5.0))
                         continue
                     except BlockedError:
@@ -347,21 +518,48 @@ def run(
                     if not isinstance(trains, list) or any(not isinstance(train, Train) for train in trains):
                         return "error"
                     for train in trains:
-                        if not trip.matches(train) or not (train.general or train.special):
+                        if not trip.matches(train):
+                            continue
+                        immediate = (
+                            ("general", train.general and "general" in supported),
+                            ("special", train.special and "special" in supported),
+                            ("standing", train.standing and trip.allow_standing and "standing" in supported),
+                            ("mixed", train.mixed and trip.allow_mixed and "mixed" in supported),
+                        )
+                        can_waitlist = train.waitlist and trip.allow_waitlist and "waitlist" in supported
+                        if not any(available for _, available in immediate) and not can_waitlist:
                             continue
                         available = True
+                        if can_waitlist and train.key not in waitlist_keys:
+                            waitlist_keys.add(train.key)
+                            waitlist_candidates.append(train)
                         if armed and train.key not in attempted:
                             attempted.add(train.key)
-                            result = _attempt(db, trip, provider, train)
+                            result = _attempt(db, trip, provider, train, immediate)
                             if result:
+                                if result == "waitlisted":
+                                    _drain_queue_outbox(db, notifier)
+                                    return _monitor_queue(db, provider, notifier, wait=wait_for_notification)
                                 _drain_outbox(db, notifier, wait=wait_for_notification)
                                 return result
                     if trains:
                         next_after = max(train.dep_time for train in trains) + ":01"
                         if next_after <= after:
                             incomplete = True
+                            pass_incomplete = True
                         elif next_after < limit:
                             pages.append((departure, arrival, next_after, limit, position))
+                if armed and waitlist_candidates and not pass_incomplete:
+                    for candidate in waitlist_candidates:
+                        if not trip.matches(candidate):
+                            continue
+                        result = _attempt(db, trip, provider, candidate, (("waitlist", True),))
+                        if result:
+                            if result == "waitlisted":
+                                _drain_queue_outbox(db, notifier)
+                                return _monitor_queue(db, provider, notifier, wait=wait_for_notification)
+                            _drain_outbox(db, notifier, wait=wait_for_notification)
+                            return result
                 cycle += 1
                 start = (start + 1) % len(targets)
                 with db:
@@ -380,19 +578,32 @@ def status(state_dir: Path) -> dict:
             "state": "new",
             "intent": None,
             "hold": None,
+            "queue": None,
+            "queue_unknown": None,
             "ambiguous_hold": None,
             "reconciliation_unknown": None,
             "notifications_pending": 0,
         }
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
-        intent, hold, mismatch = _get(db, "intent"), _get(db, "hold"), _get(db, "ambiguous_hold")
+        intent, hold, queue = _get(db, "intent"), _get(db, "hold"), _get(db, "queue")
+        mismatch, queue_unknown = _get(db, "ambiguous_hold"), _get(db, "queue_unknown")
         reconciliation_unknown = _get(db, "reconciliation_unknown")
         pending = db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
-        state = "held" if hold else "ambiguous" if intent or mismatch or reconciliation_unknown else "idle"
+        state = (
+            "held"
+            if hold
+            else "ambiguous"
+            if intent or mismatch or reconciliation_unknown or queue_unknown
+            else "queued"
+            if queue
+            else "idle"
+        )
         return {
             "state": state,
             "intent": intent,
             "hold": hold,
+            "queue": queue,
+            "queue_unknown": queue_unknown,
             "ambiguous_hold": mismatch,
             "reconciliation_unknown": reconciliation_unknown,
             "notifications_pending": pending,

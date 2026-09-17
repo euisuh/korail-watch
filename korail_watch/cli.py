@@ -90,6 +90,9 @@ def load_trip(path: Path):
             departures=tuple(trip["departures"]),
             arrivals=tuple(trip["arrivals"]),
             adults=trip.get("adults", 1),
+            allow_waitlist=trip.get("allow_waitlist", False),
+            allow_standing=trip.get("allow_standing", False),
+            allow_mixed=trip.get("allow_mixed", False),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"trip config is invalid: {path}: {exc}") from exc
@@ -130,6 +133,22 @@ def _state_dir(value: Path | None) -> Path:
     return value if value is not None else default_state_dir()
 
 
+def _warn_unsupported(trip, provider) -> None:
+    supported = getattr(provider, "supported_modes", frozenset())
+    labels = {
+        "waitlist": "waitlist",
+        "standing": "standing-only",
+        "mixed": "standing+seat",
+    }
+    for mode, label in labels.items():
+        if getattr(trip, f"allow_{mode}") and mode not in supported:
+            print(
+                f"warning: {label} was requested but is unsupported by this provider; "
+                "use the official Korail app for that mode.",
+                file=sys.stderr,
+            )
+
+
 def _execute(args: argparse.Namespace) -> str:
     if args.command == "configure":
         return configure()
@@ -163,6 +182,7 @@ def _execute(args: argparse.Namespace) -> str:
     load_credentials(*required)
     provider = KorailProvider(interval=provider_interval(args.config))
     provider.login()
+    _warn_unsupported(trip, provider)
     if args.command == "check":
         print("Read-only check started; scanning the full configured window at the safe request rate.", flush=True)
         return run(trip, provider, None, _state_dir(args.state_dir), armed=False, once=True)
