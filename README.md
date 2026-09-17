@@ -61,8 +61,10 @@ multi-stage handling is not yet verified; requesting it prints an explicit
 warning and directs you to the official Korail app while supported modes
 continue. No request flag or partial booking is invented for an unsupported mode.
 Standing-only is attempted only for the provider's exact standing availability
-markers, and account readback must confirm one standing passenger. Its request
-path is offline-tested but has not produced a live reservation in this release.
+markers, and authoritative account readback must confirm exactly one passenger
+on the exact train. A standing result stays standing; an exact one-seat result
+is recorded as seated and is never relabeled. The request path is offline-tested
+but has not produced a live reservation in this release.
 
 ## Use
 
