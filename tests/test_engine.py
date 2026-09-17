@@ -670,6 +670,43 @@ class EngineTests(unittest.TestCase):
         self.assertIn("not proof", notifier.messages[-1])
         self.assertIn("diagnostics.jsonl", notifier.messages[-1])
 
+    def test_continuous_blocked_and_account_safety_notices_are_not_called_ambiguous(self):
+        class Blocked(Provider):
+            def reservations(self):
+                raise BlockedError()
+
+        cases = (
+            ("blocked", Blocked(), "blocked", "authentication or security block"),
+            (
+                "account",
+                Provider(),
+                "ambiguous",
+                "provider or account safety check requires review",
+            ),
+        )
+        cases[1][1].remote = [
+            Hold("ONE", train(), None, None),
+            Hold("TWO", train(key="KTX-2", dep_time="13:00"), None, None),
+        ]
+        for name, provider, expected_result, expected_text in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                notifier = Notifier()
+                self.assertEqual(
+                    run(
+                        trip(),
+                        provider,
+                        notifier,
+                        Path(directory) / "state",
+                        armed=True,
+                        once=True,
+                        continuous=True,
+                    ),
+                    expected_result,
+                )
+                self.assertIn(expected_text, notifier.messages[-1])
+                self.assertNotIn("not proof", notifier.messages[-1])
+                self.assertIn("diagnostics.jsonl", notifier.messages[-1])
+
     def test_mismatched_reservation_result_is_preserved_and_blocks(self):
         class Wrong(Provider):
             def reserve(self, selected, seat_class, adults):

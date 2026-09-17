@@ -447,6 +447,14 @@ def _paid_train(db: sqlite3.Connection, train: Train) -> bool:
 
 
 def _preserve_account_unknown(db: sqlite3.Connection, reason: str, remote: list[Hold]) -> None:
+    if reason in {"search-ambiguous", "reconciliation-ambiguous"}:
+        explanation = (
+            "A booking outcome could not be confirmed; this is not proof that the request was blocked."
+        )
+    elif reason == "provider-blocked" or reason.endswith("-blocked"):
+        explanation = "Korail reported an authentication or security block that requires review."
+    else:
+        explanation = "A provider or account safety check requires review."
     with db:
         _set(
             db,
@@ -460,8 +468,7 @@ def _preserve_account_unknown(db: sqlite3.Connection, reason: str, remote: list[
         db.execute(
             "INSERT OR REPLACE INTO outbox(id, payload) VALUES (1, ?)",
             (
-                f"Korail continuous watch stopped ({reason}). A booking outcome could not be "
-                "confirmed; this is not proof that the request was blocked. Check the official "
+                f"Korail continuous watch stopped ({reason}). {explanation} Check the official "
                 "Korail app and the private diagnostics.jsonl file. No new booking will be attempted.",
             ),
         )
