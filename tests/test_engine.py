@@ -50,6 +50,35 @@ def train(**changes) -> Train:
     return Train(**values)
 
 
+def canonical_train(train_class="100", train_number="001", **changes) -> Train:
+    selected = train(**changes)
+    key = "|".join(
+        (
+            selected.date,
+            train_class,
+            train_number,
+            selected.departure,
+            selected.dep_time,
+            selected.arrival,
+            selected.arr_time,
+        )
+    )
+    return Train(
+        key=key,
+        date=selected.date,
+        departure=selected.departure,
+        arrival=selected.arrival,
+        dep_time=selected.dep_time,
+        arr_time=selected.arr_time,
+        general=selected.general,
+        special=selected.special,
+        raw=selected.raw,
+        waitlist=selected.waitlist,
+        standing=selected.standing,
+        mixed=selected.mixed,
+    )
+
+
 class Provider:
     def __init__(self, trains=()):
         self.trains = list(trains)
@@ -1295,6 +1324,259 @@ class EngineTests(unittest.TestCase):
         snapshot = status(self.state)
         self.assertEqual(snapshot["hold"]["reference"], "H2")
         self.assertEqual(snapshot["paid_tickets"][0]["reference"], "SALE-1")
+
+    def test_paid_service_overlap_exclusion_boundaries(self):
+        candidate = canonical_train()
+        cases = (
+            (
+                "overlapping-segment",
+                canonical_train(
+                    departure="광명",
+                    arrival="천안아산",
+                    dep_time="12:45",
+                    arr_time="13:10",
+                ),
+                False,
+            ),
+            (
+                "different-train-number",
+                canonical_train(
+                    train_number="002",
+                    departure="광명",
+                    arrival="천안아산",
+                    dep_time="12:45",
+                    arr_time="13:10",
+                ),
+                True,
+            ),
+            (
+                "different-train-class",
+                canonical_train(
+                    train_class="200",
+                    departure="광명",
+                    arrival="천안아산",
+                    dep_time="12:45",
+                    arr_time="13:10",
+                ),
+                True,
+            ),
+            (
+                "touching-interval",
+                canonical_train(
+                    departure="광명",
+                    arrival="서울",
+                    dep_time="11:30",
+                    arr_time="12:30",
+                ),
+                True,
+            ),
+            (
+                "nonoverlapping-interval",
+                canonical_train(
+                    departure="천안아산",
+                    arrival="부산",
+                    dep_time="14:00",
+                    arr_time="16:00",
+                ),
+                True,
+            ),
+            (
+                "overnight-interval",
+                canonical_train(
+                    departure="서울",
+                    arrival="부산",
+                    dep_time="23:00",
+                    arr_time="01:00",
+                ),
+                False,
+            ),
+            (
+                "different-date",
+                canonical_train(
+                    date="2099-09-25",
+                    departure="광명",
+                    arrival="천안아산",
+                    dep_time="12:45",
+                    arr_time="13:10",
+                ),
+                True,
+            ),
+            (
+                "inconsistent-canonical-key",
+                train(
+                    key="2099-09-24|100|001|광명|12:45|천안아산|13:10",
+                    departure="부산",
+                    arrival="대구",
+                    dep_time="12:45",
+                    arr_time="13:10",
+                ),
+                True,
+            ),
+            (
+                "nondigit-train-class",
+                canonical_train(
+                    train_class="KTX",
+                    departure="광명",
+                    arrival="천안아산",
+                    dep_time="12:45",
+                    arr_time="13:10",
+                ),
+                True,
+            ),
+            (
+                "nonascii-train-number",
+                canonical_train(
+                    train_number="００１",
+                    departure="광명",
+                    arrival="천안아산",
+                    dep_time="12:45",
+                    arr_time="13:10",
+                ),
+                True,
+            ),
+        )
+        for name, paid_train, should_reserve in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                provider = Provider([candidate])
+                provider.paid = [Hold("SALE", paid_train, None, 50_000, paid=True)]
+                result = run(
+                    trip(),
+                    provider,
+                    Notifier(),
+                    Path(directory) / "state",
+                    armed=True,
+                    once=True,
+                    continuous=True,
+                )
+                self.assertEqual("reserved" if should_reserve else "available", result)
+                self.assertEqual(should_reserve, bool(provider.reserve_calls))
+
+        legacy = train(key="LEGACY")
+        provider = Provider([legacy])
+        provider.paid = [Hold("SALE", legacy, None, 50_000, paid=True)]
+        self.assertEqual(
+            "available",
+            run(
+                trip(),
+                provider,
+                Notifier(),
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+        )
+        self.assertEqual([], provider.reserve_calls)
+
+    def test_all_continuous_account_paths_retain_partial_paid_leg_without_settling_state(self):
+        full = canonical_train()
+        partial = canonical_train(
+            departure="광명",
+            arrival="천안아산",
+            dep_time="12:45",
+            arr_time="13:10",
+        )
+        paid = Hold("SALE", partial, None, 20_000, paid=True)
+        next_leg = canonical_train(
+            departure="천안아산",
+            arrival="부산",
+            dep_time="13:10",
+            arr_time="15:00",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "reconcile"
+            provider = Provider()
+            provider.paid = [paid, Hold("SALE", next_leg, None, 30_000, paid=True)]
+            self.assertEqual(
+                "not-found",
+                run(trip(), provider, Notifier(), state, armed=True, once=True, continuous=True),
+            )
+            self.assertEqual(
+                [partial.key, next_leg.key],
+                [item["train"]["key"] for item in status(state)["paid_tickets"]],
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.state = Path(directory) / "hold"
+            held = Hold("H1", full, "2099-09-24T14:00:00+09:00", 50_000)
+            self._seed_hold(held)
+            provider, notifier = Provider(), Notifier()
+            provider.remote, provider.paid = [held], [paid]
+            self.assertEqual(
+                "payment-pending",
+                run(trip(), provider, notifier, self.state, armed=True, once=True, continuous=True),
+            )
+            snapshot = status(self.state)
+            self.assertEqual("H1", snapshot["hold"]["reference"])
+            self.assertEqual([partial.key], [item["train"]["key"] for item in snapshot["paid_tickets"]])
+            self.assertNotIn("payment is confirmed", " ".join(notifier.messages))
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.state = Path(directory) / "queue"
+            queued_train = canonical_train(general=False, special=False, waitlist=True)
+            requested = trip(allow_waitlist=True)
+            self.assertEqual(
+                "queued",
+                run(
+                    requested,
+                    QueueProvider([queued_train]),
+                    Notifier(),
+                    self.state,
+                    armed=True,
+                    once=True,
+                ),
+            )
+            provider = QueueProvider()
+            provider.remote = [Hold("Q1", queued_train, None, None, kind="waitlist")]
+            provider.paid = [paid]
+            self.assertEqual(
+                "queued",
+                run(
+                    requested,
+                    provider,
+                    Notifier(),
+                    self.state,
+                    armed=True,
+                    once=True,
+                    continuous=True,
+                ),
+            )
+            snapshot = status(self.state)
+            self.assertEqual("Q1", snapshot["queue"]["reference"])
+            self.assertEqual([partial.key], [item["train"]["key"] for item in snapshot["paid_tickets"]])
+
+    def test_partial_paid_leg_never_clears_pending_intent(self):
+        candidate = canonical_train()
+        partial = canonical_train(
+            departure="광명",
+            arrival="천안아산",
+            dep_time="12:45",
+            arr_time="13:10",
+        )
+
+        class Crash(Provider):
+            def reserve(self, selected, kind, adults):
+                raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            run(trip(), Crash([candidate]), Notifier(), self.state, armed=True, once=True)
+
+        provider = Provider()
+        provider.paid = [Hold("SALE", partial, None, 20_000, paid=True)]
+        self.assertEqual(
+            "ambiguous",
+            run(
+                trip(),
+                provider,
+                Notifier(),
+                self.state,
+                armed=True,
+                once=True,
+                continuous=True,
+            ),
+        )
+        self.assertIsNotNone(status(self.state)["intent"])
 
     def test_continuous_waitlist_allocation_enters_expiry_monitor(self):
         candidate = train(general=False, special=False, waitlist=True)

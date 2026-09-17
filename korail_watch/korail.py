@@ -59,7 +59,7 @@ class _PacedSession(requests.Session):
             str, tuple[str | None, int | None, int | None] | None
         ] = {}
         self.search_status: dict[str, tuple[str | None, str | None]] = {}
-        self.ticket_status: dict[str, tuple[str, str]] = {}
+        self.ticket_status: dict[tuple[str, str], str] = {}
         self.ticket_complete = False
         self.reservation_overrides: dict[str, str] = {}
         self.last_reservation_response: dict | None = None
@@ -212,7 +212,8 @@ class _PacedSession(requests.Session):
             records = payload["reservation_list"]
             if not isinstance(records, list):
                 return
-            snapshot: dict[str, tuple[str, str]] = {}
+            snapshot: dict[tuple[str, str], str] = {}
+            references: dict[str, str] = {}
             for record in records:
                 ticket_list = record["ticket_list"]
                 if not isinstance(ticket_list, list) or len(ticket_list) != 1:
@@ -236,9 +237,15 @@ class _PacedSession(requests.Session):
                     )
                 )
                 record_key = _record_key(row)
-                if not all(record_key.split("|")) or reference in snapshot:
+                composite = (reference, record_key)
+                if (
+                    not all(record_key.split("|"))
+                    or composite in snapshot
+                    or reference in references and references[reference] != pnr
+                ):
                     return
-                snapshot[reference] = (pnr, record_key)
+                references[reference] = pnr
+                snapshot[composite] = pnr
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return
         self.ticket_status = snapshot
@@ -409,7 +416,13 @@ class KorailProvider:
             if not self._session.ticket_complete or not isinstance(raw_tickets, list):
                 raise AmbiguousReservation("Korail ticket list is incomplete")
             holds = [self._hold(item, paid=True) for item in raw_tickets]
-            if len(holds) != len(self._session.ticket_status):
+            composites = [
+                (str(item.get_ticket_no()), _raw_key(item)) for item in raw_tickets
+            ]
+            if (
+                len(composites) != len(set(composites))
+                or set(composites) != set(self._session.ticket_status)
+            ):
                 raise AmbiguousReservation("Korail ticket list is incomplete")
             return holds
 
@@ -519,8 +532,8 @@ class KorailProvider:
             reference = raw.get_ticket_no()
             deadline = None
             seats = _integer(getattr(raw, "seat_no_count", None))
-            status = self._session.ticket_status.get(str(reference))
-            if seats == 1 and status is not None and status[1] == _raw_key(raw):
+            status = self._session.ticket_status.get((str(reference), _raw_key(raw)))
+            if seats == 1 and status is not None:
                 kind = "seated"
             else:
                 raise AmbiguousReservation("Korail ticket seating status is unavailable")
