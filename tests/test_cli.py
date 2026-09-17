@@ -21,6 +21,65 @@ class CliTests(unittest.TestCase):
         )
         return path
 
+    def _launchd_fixture(self, root: Path):
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        scripts = {
+            "korail-watch": """#!/bin/sh
+printf '%s\n' "$*" >> "$WATCH_CALLS"
+printf '%s\n' "${CHECK_RESULT:-not-found}"
+""",
+            "caffeinate": "#!/bin/sh\nexit 0\n",
+            "id": "#!/bin/sh\n[ \"$1\" = -u ] || exit 2\necho 501\n",
+            "launchctl": """#!/bin/sh
+printf '%s\n' "$*" >> "$LAUNCHCTL_CALLS"
+case "$1" in
+  print)
+    if [ -n "${PRINT_ERROR_STATUS:-}" ]; then
+      echo "inspection failed" >&2
+      exit "$PRINT_ERROR_STATUS"
+    fi
+    if [ -f "$LOADED_MARKER" ]; then
+      exit 0
+    fi
+    echo 'Could not find service "com.euisuh.korail-watch" in domain for user gui: 501' >&2
+    exit 113
+    ;;
+  disable|enable) exit 0 ;;
+  bootout)
+    if [ -n "${BOOTOUT_ERROR_STATUS:-}" ]; then
+      echo "bootout failed" >&2
+      exit "$BOOTOUT_ERROR_STATUS"
+    fi
+    [ "${KEEP_LOADED:-0}" = 1 ] || rm -f "$LOADED_MARKER"
+    ;;
+  bootstrap) touch "$LOADED_MARKER" ;;
+  kickstart) exit 0 ;;
+  *) exit 64 ;;
+esac
+""",
+        }
+        for name, body in scripts.items():
+            executable = fake_bin / name
+            executable.write_text(body)
+            executable.chmod(0o755)
+        config = self._trip_config(str(root))
+        calls = root / "launchctl.calls"
+        watch_calls = root / "watch.calls"
+        loaded = root / "loaded"
+        env = {
+            **os.environ,
+            "HOME": str(root),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "LAUNCHCTL_CALLS": str(calls),
+            "WATCH_CALLS": str(watch_calls),
+            "LOADED_MARKER": str(loaded),
+        }
+        env.pop("UID", None)
+        script = Path(__file__).parents[1] / "scripts" / "launchd.sh"
+        plist = root / "Library" / "LaunchAgents" / "com.euisuh.korail-watch.plist"
+        return script, config, plist, calls, loaded, env
+
     def test_configure_writes_private_credentials_outside_repository(self):
         values = iter(("member", "password", "token", "chat"))
         with tempfile.TemporaryDirectory() as home, patch.object(Path, "home", return_value=Path(home)), patch(
@@ -145,31 +204,12 @@ class CliTests(unittest.TestCase):
         self.assertTrue(trip.allow_standing)
         self.assertFalse(trip.allow_mixed)
 
-    def test_launchd_helper_adds_continuous_only_when_requested(self):
+    def test_launchd_install_modes_and_failed_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fake_bin = root / "bin"
-            fake_bin.mkdir()
-            for name, body in {
-                "korail-watch": "#!/bin/sh\necho not-found\n",
-                "caffeinate": "#!/bin/sh\nexit 0\n",
-                "launchctl": "#!/bin/sh\nexit 0\n",
-            }.items():
-                executable = fake_bin / name
-                executable.write_text(body)
-                executable.chmod(0o755)
-            config = root / "trip.toml"
-            config.write_text("[trip]\n")
-            script = Path(__file__).parents[1] / "scripts" / "launchd.sh"
-            env = {
-                **os.environ,
-                "HOME": str(root),
-                "UID": "501",
-                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-            }
+            script, config, plist, calls, _loaded, env = self._launchd_fixture(root)
 
             subprocess.run(["sh", script, "install", config, "--continuous"], env=env, check=True, capture_output=True)
-            plist = root / "Library" / "LaunchAgents" / "com.euisuh.korail-watch.plist"
             with plist.open("rb") as handle:
                 continuous = plistlib.load(handle)["ProgramArguments"]
             self.assertEqual("--continuous", continuous[-1])
@@ -178,6 +218,138 @@ class CliTests(unittest.TestCase):
             with plist.open("rb") as handle:
                 legacy = plistlib.load(handle)["ProgramArguments"]
             self.assertNotIn("--continuous", legacy)
+
+            saved = plist.read_bytes()
+            calls.write_text("")
+            failed = subprocess.run(
+                ["sh", script, "install", config],
+                env={**env, "CHECK_RESULT": "blocked"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(0, failed.returncode)
+            self.assertEqual("", calls.read_text())
+            self.assertEqual(saved, plist.read_bytes())
+
+    def test_launchd_pause_is_persistent_idempotent_and_preserves_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script, config, plist, calls, loaded, env = self._launchd_fixture(root)
+            plist.parent.mkdir(parents=True)
+            plist.write_bytes(b"saved plist")
+            log = root / "Library" / "Logs" / "korail-watch.log"
+            log.parent.mkdir(parents=True)
+            log.write_text("saved log")
+            loaded.touch()
+
+            paused = subprocess.run(
+                ["sh", script, "pause"], env=env, check=True, capture_output=True, text=True
+            )
+            target = "gui/501/com.euisuh.korail-watch"
+            self.assertEqual(
+                [f"disable {target}", f"print {target}", f"bootout {target}", f"print {target}"],
+                calls.read_text().splitlines(),
+            )
+            self.assertIn("saved installation remains disabled", paused.stdout)
+            self.assertFalse(loaded.exists())
+            self.assertEqual(b"saved plist", plist.read_bytes())
+            self.assertTrue(config.exists())
+            self.assertEqual("saved log", log.read_text())
+
+            calls.write_text("")
+            subprocess.run(["sh", script, "pause"], env=env, check=True, capture_output=True)
+            self.assertEqual([f"disable {target}", f"print {target}"], calls.read_text().splitlines())
+
+    def test_launchd_propagates_inspection_unload_and_still_loaded_failures(self):
+        cases = (
+            ({"PRINT_ERROR_STATUS": "1"}, 1, "inspection failed"),
+            ({"BOOTOUT_ERROR_STATUS": "7"}, 7, "bootout failed"),
+            ({"KEEP_LOADED": "1"}, 1, "still loaded"),
+        )
+        for overrides, expected_status, message in cases:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                script, _config, plist, calls, loaded, env = self._launchd_fixture(root)
+                plist.parent.mkdir(parents=True)
+                plist.write_bytes(b"saved")
+                loaded.touch()
+                result = subprocess.run(
+                    ["sh", script, "pause"],
+                    env={**env, **overrides},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(expected_status, result.returncode)
+                self.assertIn(message, result.stderr.lower())
+                self.assertNotIn("Paused", result.stdout)
+                self.assertEqual(b"saved", plist.read_bytes())
+                self.assertEqual("disable", calls.read_text().split()[0])
+
+    def test_launchd_resume_reuses_saved_install_without_killing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script, _config, plist, calls, loaded, env = self._launchd_fixture(root)
+            missing = subprocess.run(
+                ["sh", script, "resume"], env=env, capture_output=True, text=True
+            )
+            self.assertNotEqual(0, missing.returncode)
+            self.assertFalse(calls.exists())
+
+            plist.parent.mkdir(parents=True)
+            plist.write_bytes(b"saved continuous plist")
+            saved = plist.read_bytes()
+            resumed = subprocess.run(
+                ["sh", script, "resume"], env=env, check=True, capture_output=True, text=True
+            )
+            target = "gui/501/com.euisuh.korail-watch"
+            self.assertEqual(
+                [f"enable {target}", f"print {target}", f"bootstrap gui/501 {plist}"],
+                calls.read_text().splitlines(),
+            )
+            self.assertIn("resume requested", resumed.stdout.lower())
+            self.assertIn("not verified", resumed.stdout.lower())
+            self.assertEqual(saved, plist.read_bytes())
+
+            calls.write_text("")
+            subprocess.run(["sh", script, "resume"], env=env, check=True, capture_output=True)
+            loaded_calls = calls.read_text().splitlines()
+            self.assertEqual(
+                [f"enable {target}", f"print {target}", f"kickstart {target}"], loaded_calls
+            )
+            self.assertFalse(any(" -k" in call or call.startswith("kickstart -k") for call in loaded_calls))
+            self.assertFalse(any(call.startswith("bootout") for call in loaded_calls))
+
+    def test_launchd_uninstall_and_argument_validation(self):
+        invalid = (
+            (),
+            ("unknown",),
+            ("pause", "extra"),
+            ("resume", "extra"),
+            ("uninstall", "extra"),
+            ("install", "trip.toml", "--continuous", "extra"),
+            ("install", "trip.toml", "--invalid"),
+        )
+        for argv in invalid:
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                script, _config, _plist, calls, _loaded, env = self._launchd_fixture(root)
+                result = subprocess.run(["sh", script, *argv], env=env, capture_output=True)
+                self.assertEqual(2, result.returncode)
+                self.assertFalse(calls.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script, _config, plist, calls, loaded, env = self._launchd_fixture(root)
+            plist.parent.mkdir(parents=True)
+            plist.write_bytes(b"saved")
+            loaded.touch()
+            subprocess.run(["sh", script, "uninstall"], env=env, check=True, capture_output=True)
+            target = "gui/501/com.euisuh.korail-watch"
+            self.assertEqual(
+                [f"disable {target}", f"print {target}", f"bootout {target}", f"print {target}"],
+                calls.read_text().splitlines(),
+            )
+            self.assertFalse(plist.exists())
 
     def test_status_redacts_paid_references_recursively(self):
         snapshot = {

@@ -5,7 +5,59 @@ label=com.euisuh.korail-watch
 agents="$HOME/Library/LaunchAgents"
 plist="$agents/$label.plist"
 
+usage() {
+  echo "usage: $0 install [/absolute/path/to/trip.toml] [--continuous] | pause | resume | uninstall" >&2
+  exit 2
+}
+
 case "${1:-}" in
+  install) [ "$#" -le 3 ] || usage ;;
+  pause|resume|uninstall) [ "$#" -eq 1 ] || usage ;;
+  *) usage ;;
+esac
+
+uid=${UID:-$(id -u)}
+case "$uid" in
+  ""|*[!0-9]*) echo "Could not determine the current user ID" >&2; exit 1 ;;
+esac
+domain="gui/$uid"
+target="$domain/$label"
+inspection_error=$(mktemp "${TMPDIR:-/tmp}/korail-watch-launchctl.XXXXXX")
+trap 'rm -f "$inspection_error"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+job_loaded() {
+  if launchctl print "$target" >/dev/null 2>"$inspection_error"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 113 ] &&
+    grep -Fq "Could not find service \"$label\" in domain for user gui: $uid" "$inspection_error"
+  then
+    return 1
+  fi
+  cat "$inspection_error" >&2
+  exit "$status"
+}
+
+unload_if_loaded() {
+  if job_loaded; then
+    launchctl bootout "$target"
+  else
+    return 0
+  fi
+  if job_loaded; then
+    echo "Service is still loaded after bootout: $target" >&2
+    return 1
+  else
+    return 0
+  fi
+}
+
+case "$1" in
   install)
     config=${2:-"$PWD/trip.toml"}
     mode=${3:-}
@@ -24,6 +76,8 @@ case "${1:-}" in
       available|not-found) ;;
       *) echo "Read-only check did not complete safely: $result" >&2; exit 1 ;;
     esac
+    launchctl disable "$target"
+    unload_if_loaded
     mkdir -p "$agents" "$HOME/Library/Logs"
     python3 - "$plist" "$caffeinate" "$watcher" "$config" "$config_dir" "$mode" <<'PY'
 import plistlib
@@ -46,17 +100,32 @@ with open(path, "wb") as handle:
     plistlib.dump(payload, handle)
 PY
     chmod 600 "$plist"
-    launchctl bootout "gui/$UID/$label" 2>/dev/null || true
-    launchctl bootstrap "gui/$UID" "$plist"
-    echo "Installed and started $label"
+    launchctl enable "$target"
+    launchctl bootstrap "$domain" "$plist"
+    echo "Installed $label; startup requested. Check logs and status."
+    ;;
+  pause)
+    launchctl disable "$target"
+    unload_if_loaded
+    echo "Paused $label; saved installation remains disabled."
+    ;;
+  resume)
+    [ -f "$plist" ] || {
+      echo "No saved installation found: $plist" >&2
+      exit 1
+    }
+    launchctl enable "$target"
+    if job_loaded; then
+      launchctl kickstart "$target"
+    else
+      launchctl bootstrap "$domain" "$plist"
+    fi
+    echo "Resume requested for $label; startup health is not verified. Check logs and status."
     ;;
   uninstall)
-    launchctl bootout "gui/$UID/$label" 2>/dev/null || true
+    launchctl disable "$target"
+    unload_if_loaded
     rm -f "$plist"
     echo "Uninstalled $label"
-    ;;
-  *)
-    echo "usage: $0 install [/absolute/path/to/trip.toml] [--continuous] | uninstall" >&2
-    exit 2
     ;;
 esac
