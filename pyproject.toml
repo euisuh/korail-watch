@@ -19,3 +19,7 @@ korail-watch = "korail_watch.cli:main"
 [tool.setuptools.packages.find]
 include = ["korail_watch*"]
 
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E731"]
