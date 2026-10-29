@@ -11,6 +11,23 @@ It is not affiliated with or supported by Korail. The inherited DynaPath
 headers provide compatibility, not a guarantee of access. Korail can change or
 block the interface at any time.
 
+**한국어 요약.** 지정한 날짜·시간대·역 조합에서 승차권 1매(성인 1명)를 찾아 예약하고
+Telegram으로 알려 주는 macOS용 CLI입니다. 결제와 취소는 하지 않으며, 결제는 공식
+코레일 앱에서 직접 해야 합니다. 비공식 모바일 인터페이스를 사용하므로 코레일의 이용약관을
+확인하고 본인 책임 하에 사용하세요. 요청 간격은 최소 5초이며, 설정 방법은 아래 영문 설명을
+따릅니다.
+
+## Responsible use
+
+- Using an unofficial interface may conflict with Korail's terms of service.
+  Read them and decide for yourself; the authors accept no responsibility for
+  account action or missed trains.
+- Use it for your own trip with your own account. Do not run several accounts
+  or instances, and do not lower the request interval: `provider.interval`
+  below 5 seconds is rejected, and the HTTP session enforces a 5 second floor
+  plus up to 0.5 seconds of random jitter.
+- Reservations are not payments. Pay in the official app before the deadline.
+
 ## Install on macOS
 
 Python 3.11 or newer and Git are required. With
@@ -55,6 +72,31 @@ allow_mixed = false
 [provider]
 interval = 5.0
 ```
+
+### Configuration reference
+
+`trip.toml` (parsed by `load_trip` in `korail_watch/cli.py`, validated by
+`Trip` in `korail_watch/domain.py`):
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `trip.date` | string | required | Travel date, `YYYY-MM-DD`. |
+| `trip.start`, `trip.end` | string | required | Departure window `HH:MM`; `start` must not be after `end`. |
+| `trip.departures` | list of strings | required | Exact station names, non-empty, no duplicates. |
+| `trip.arrivals` | list of strings | required | Must not overlap `departures`. |
+| `trip.adults` | int | `1` | Only `1` is accepted. |
+| `trip.allow_waitlist` | bool | `false` | Join one waitlist if nothing is immediately available. |
+| `trip.allow_standing` | bool | `false` | Accept standing-only tickets. |
+| `trip.allow_mixed` | bool | `false` | Unsupported by the provider; `true` only prints a warning. |
+| `provider.interval` | number | `5.0` | Seconds between requests, at least 5. |
+
+Credentials come from the environment first, then from `credentials.toml`
+written by `korail-watch configure`: `KORAIL_ID`, `KORAIL_PASSWORD`,
+`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. The credentials file must not be
+group- or world-accessible or loading fails. State defaults to
+`~/Library/Application Support/korail-watch/state`; override with
+`--state-dir`. There is no Dockerfile: the project targets a local macOS
+session (launchd helper included).
 
 Departure and arrival lists are exact allowlists. If the unofficial API cannot
 expose a configured service, that search returns no trains; the watcher never

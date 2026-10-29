@@ -15,7 +15,6 @@ import requests
 from korail_watch.domain import (
     AmbiguousReservation,
     BlockedError,
-    Hold,
     ReservationNotSent,
     SoldOut,
     TransientError,
